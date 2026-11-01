@@ -1,0 +1,5925 @@
+# =============================================================================
+# DRAFT - Standalone inverter controller on a Cheap Yellow Display (ESP32-2432S028R)
+# Axpert VMIII-4000 (24V) via RS232 (MAX3232) -> CYD CN1 connector (GPIO22/GPIO27)
+#
+# Board (confirmed 2026-11-01): ESP32-2432S028R, 2.8" ILI9341 320x240, XPT2046 touch,
+# no PSRAM. Pins used: TFT 14/13/12/15/2, backlight 21, touch 25/32/39/33/36,
+# RGB LED 4/16/17, speaker P4 = GPIO26 (on-board amp), LDR = GPIO34,
+# inverter UART on CN1 = GPIO22 (TX) / GPIO27 (RX).
+# Free/avoid: SD card 5/18/19/23 (unused), BOOT button GPIO0, P3 = 35/22/21
+# (22 is our UART TX, 21 is the backlight - do not use P3).
+#
+# Replaces inverter-esphome.yaml AND the 8 Home Assistant automations.
+# HA stays optional: the native API is still exposed for history/dashboards,
+# but nothing here needs HA to be running.
+#
+# See ../ESPHOME_STANDALONE_CASE_STUDY.md for the rule-by-rule mapping.
+# =============================================================================
+
+substitutions:
+  name: inverter-cyd            # change to inverter_esphome when it replaces the old board
+  friendly_name: inverter-cyd
+  timezone: Asia/Damascus       # UTC+3 all year; HA is set to Africa/Cairo, old ESP to Europe/Sofia
+  latitude: "36.15"
+  longitude: "36.73"
+  # Forecast.Solar plane: now the "PV Array Size / Tilt / Azimuth" settings (Advanced > Solar panels)
+  # buzzer alarm levels (no grid)
+  alarm_soc: "30"
+  repeat_soc: "20"
+  # All rule thresholds are "number" entities (config category), editable on the
+  # screen (Setup tabs) and from HA. Defaults = the values the HA automations used.
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - lambda: 'id(boot_ms) = std::max<uint32_t>(millis(), 1);'   # never 0, never in the future
+      - script.execute: ui_sync_all
+      - lambda: |-
+          uint8_t o = id(touch_orient);
+          id(touch).set_swap_xy(o & 4);
+          id(touch).set_mirror_x(o & 2);
+          id(touch).set_mirror_y(o & 1);
+      - lambda: |-
+          id(led_r).set_max_power(id(n_led_r).state / 100.0f);
+          id(led_g).set_max_power(id(n_led_g).state / 100.0f);
+          id(led_b).set_max_power(id(n_led_b).state / 100.0f);
+      - script.execute: led_selftest
+
+esp32:
+  board: esp32dev
+  variant: esp32
+  cpu_frequency: 240MHZ
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # HTTPS (Forecast.Solar) on a no-PSRAM board: TLS buffers are allocated only
+      # during the fetch and freed after it, instead of ~40 KB held permanently.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT: y
+      # We only send small requests; incoming stays 16 KB (servers may send full records).
+      CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN: y
+      CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN: "4096"
+      # Common CA subset (has ISRG Root X1, used by api.forecast.solar). Saves flash.
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN: y
+
+# Settings are saved to flash at most every 15 s (default 1 min), so a change
+# made just before a power cut is not lost.
+preferences:
+  flash_write_interval: 15s
+
+logger:
+  level: WARN
+
+# Standalone: never reboot because HA or WiFi is missing (defaults are 15 min).
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: NONE
+  min_auth_mode: WPA2
+  reboot_timeout: 0s
+  manual_ip:
+    static_ip: 192.168.10.4      # .3 is the current inverter board; switch to .3 at cut-over
+    gateway: 192.168.10.1
+    subnet: 255.255.255.0
+    dns1: 8.8.8.8
+    dns2: 8.8.4.4
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+    on_time:
+      # Persistence forecast (no internet): remember today's measured solar before it resets.
+      - seconds: 30
+        minutes: 59
+        hours: 23
+        then:
+          - lambda: 'if (!isnan(id(e_solar_today).state)) id(sol_yday_kwh) = id(e_solar_today).state;'
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(fc_today_kwh) = id(fc_tomorrow_kwh);    // refreshed by the next fetch
+              id(fc_tomorrow_kwh) = NAN;
+              id(fc_curve).clear();
+  - platform: homeassistant      # extra source when HA happens to be up
+    id: ha_time
+
+sun:
+  id: sun_c
+  latitude: ${latitude}°
+  longitude: ${longitude}°
+
+debug:
+  update_interval: 30s
+
+http_request:
+  timeout: 10s
+  verify_ssl: true
+  watchdog_timeout: 20s          # the request blocks the loop; TLS handshake takes a few s
+
+# -----------------------------------------------------------------------------
+# CYD HARDWARE
+# -----------------------------------------------------------------------------
+spi:
+  - id: spi_tft
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: spi_touch
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+uart:
+  id: uart_inverter
+  tx_pin: GPIO22                 # CN1 pin 2
+  rx_pin: GPIO27                 # CN1 pin 3
+  baud_rate: 2400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+pipsolar:
+  id: my_inverter
+  uart_id: uart_inverter
+
+display:
+  # ESPHome preset for the 2-USB (USB-C + micro) CYD: ILI9342, natively 320x240 landscape.
+  # (240x320 + swap_xy on the ILI9341 driver gave a clean but portrait image = native landscape.)
+  - platform: mipi_spi
+    id: tft
+    model: ESP32-2432S028-9342
+    spi_id: spi_tft
+    # red showed as yellow with invert on + BGR, so both are flipped
+    invert_colors: false
+    color_order: rgb
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: xpt2046
+    id: touch
+    spi_id: spi_touch
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    threshold: 400
+    calibration:                 # calibrate per board
+      x_min: 280
+      x_max: 3860
+      y_min: 340
+      y_max: 3860
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: true
+    on_touch:
+      - script.execute: bl_wake
+      - if:
+          condition: { switch.is_on: sw_touchdbg }
+          then:
+            - lvgl.widget.update:
+                id: touch_dot
+                hidden: false
+                x: !lambda 'return touch.x - 5;'
+                y: !lambda 'return touch.y - 5;'
+            - lambda: 'ESP_LOGW("touch", "x=%d y=%d raw=%d,%d", touch.x, touch.y, touch.x_raw, touch.y_raw);'
+
+output:
+  # CYD speaker connector P4 (GPIO26 -> on-board amplifier). PWM buzzer module or 8 ohm speaker.
+  - platform: ledc
+    id: spk_out
+    pin: GPIO26
+  - platform: ledc
+    id: bl_out
+    pin: GPIO21
+  # RGB LED on the back of the board: common anode -> a pin LOW lights its colour (inverted)
+  - platform: ledc
+    id: led_r
+    pin: { number: GPIO4, inverted: true }
+    max_power: 100%              # runtime-scaled by the LED * Level settings
+  - platform: ledc
+    id: led_g
+    pin: { number: GPIO16, inverted: true }
+    max_power: 100%              # runtime-scaled by the LED * Level settings
+  - platform: ledc
+    id: led_b
+    pin: { number: GPIO17, inverted: true }
+    max_power: 100%              # runtime-scaled by the LED * Level settings
+
+  # ---- Inverter writable settings (unchanged from inverter-esphome.yaml) ----
+  - platform: pipsolar
+    pipsolar_id: my_inverter
+    output_source_priority:
+      id: out_output_source_priority
+      possible_values: [0, 1, 2]
+    charger_source_priority:
+      id: out_charger_source_priority
+      possible_values: [0, 1, 2, 3]
+    current_max_ac_charging_current:
+      id: out_max_ac_charging_current
+      possible_values: [2, 10, 20, 30, 40, 50, 60]
+    battery_recharge_voltage:
+      id: out_battery_recharge_voltage
+      possible_values: [22.0, 22.5, 23.0, 23.5, 24.0, 24.5, 25.0, 25.5]
+    battery_redischarge_voltage:
+      id: out_battery_redischarge_voltage
+      possible_values: [24.0, 24.5, 25.0, 25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0]
+    battery_under_voltage:
+      id: out_battery_under_voltage
+      possible_values: [21.0, 21.1, 21.2, 21.3, 21.4, 21.5, 21.6, 21.7, 21.8, 21.9, 22.0, 22.1, 22.2, 22.3, 22.4, 22.5, 22.6, 22.7, 22.8, 22.9, 23.0, 23.1, 23.2, 23.3, 23.4, 23.5, 23.6, 23.7, 23.8, 23.9, 24.0]
+    battery_float_voltage:
+      id: out_battery_float_voltage
+      possible_values: [24.0, 24.1, 24.2, 24.3, 24.4, 24.5, 24.6, 24.7, 24.8, 24.9, 25.0, 25.1, 25.2, 25.3, 25.4, 25.5, 25.6, 25.7, 25.8, 25.9, 26.0, 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 26.8, 26.9, 27.0, 27.1, 27.2, 27.3, 27.4, 27.5, 27.6, 27.7, 27.8, 27.9, 28.0, 28.1, 28.2, 28.3, 28.4, 28.5, 28.6, 28.7, 28.8, 28.9, 29.0, 29.1, 29.2]
+
+rtttl:
+  id: buzzer
+  output: spk_out
+  gain: 60%
+  on_finished_playback:
+    - lambda: 'id(tune_prio) = 0;'
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "Display Backlight"
+    internal: true
+    output: bl_out
+    restore_mode: ALWAYS_ON
+    gamma_correct: 1.0           # default 2.8 made "15 %" ~0.5 % = looked off
+    default_transition_length: 250ms
+  - platform: rgb
+    id: status_led
+    name: "Status LED"
+    internal: true
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: ALWAYS_OFF
+    gamma_correct: 1.0           # default 2.8 made the LED very dim and mixed colours wrong
+
+# -----------------------------------------------------------------------------
+# STATE
+# -----------------------------------------------------------------------------
+globals:
+  - id: tune_prio
+    type: uint8_t
+    initial_value: '0'
+  - id: low_alarmed
+    type: bool
+    initial_value: 'false'
+  - id: boot_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: last_inverter_data
+    type: uint32_t
+    initial_value: '0'
+  # Bitmask of reasons that want "Solar first (SUB)" (= grid allowed). 0 -> SBU.
+  - id: sub_reasons
+    type: uint8_t
+    restore_value: true          # survive a reboot mid low-battery event
+    initial_value: '0'
+  - id: fc_today_kwh
+    type: float
+    initial_value: 'NAN'
+  # ---- controller v2 state
+  - id: reserve_sw              # planner output: go to grid below (%)
+    type: float
+    restore_value: true
+    initial_value: '25'
+  - id: reserve_ret             # planner output: back to battery above (%)
+    type: float
+    restore_value: true
+    initial_value: '30'
+  - id: cloudy                  # planner: coming day is cloudy (unknown counts as cloudy)
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: plan_fc                 # forecast kWh the planner used (NAN = unknown)
+    type: float
+    initial_value: 'NAN'
+  - id: charging                # charger manager latch
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: sol_yday_kwh            # yesterday's measured solar (persistence forecast)
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: sunrise_ts              # epoch of the last sunrise (sun crossing -0.833 deg upward)
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: load_ring               # 180 one-minute load means = 3 h
+    type: std::array<uint16_t, 180>
+  - id: load_n
+    type: uint16_t
+    initial_value: '0'
+  - id: load_pos
+    type: uint16_t
+    initial_value: '0'
+  - id: load_acc                # sum / count of load readings in the current minute
+    type: float
+    initial_value: '0'
+  - id: load_cnt
+    type: uint16_t
+    initial_value: '0'
+  - id: load_median             # 3 h median load (NAN until 30 min of data)
+    type: float
+    initial_value: 'NAN'
+  - id: load_mean5              # mean of the last 5 minutes
+    type: float
+    initial_value: 'NAN'
+  - id: base_load               # max(3 h median, Base Load Floor)
+    type: float
+    initial_value: '300'
+  - id: soc_at_sun              # predicted SOC when the sun becomes useful (NAN = unknown)
+    type: float
+    initial_value: 'NAN'
+  - id: want_sub                # controller decision (also shown in observe-only mode)
+    type: bool
+    initial_value: 'false'
+  - id: sub_since               # millis() since the inverter reads back SUB (0 = not SUB)
+    type: uint32_t
+    initial_value: '0'
+  - id: ctl_fault               # a priority / charger write did not take after a retry
+    type: bool
+    initial_value: 'false'
+  - id: fc_tomorrow_kwh
+    type: float
+    initial_value: 'NAN'
+  # today's forecast curve: (minute of day, W), from Forecast.Solar /estimate/watts
+  - id: fc_curve
+    type: std::vector<std::pair<int, float>>
+  - id: fc_updated              # "HH:MM" of the last good fetch, empty = never
+    type: std::string
+  - id: fc_last_try             # millis() of the last fetch attempt, 0 = never
+    type: uint32_t
+    initial_value: '0'
+  # Touch orientation, bit 2 = swap_xy, bit 1 = mirror_x, bit 0 = mirror_y.
+  # BOOT button cycles it (saved), so it can be fixed without reflashing.
+  - id: touch_orient
+    type: uint8_t
+    restore_value: true
+    initial_value: '7'
+  # LED self-test running (status LED logic paused)
+  - id: led_test
+    type: bool
+    initial_value: 'true'
+  # Restore-defaults confirmation: time of the first tap (0 = not armed)
+  - id: reset_armed
+    type: uint32_t
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# USER SETTINGS (replace HA input_number helpers; editable on screen and in HA)
+# -----------------------------------------------------------------------------
+switch:
+  # Generated from tools/cyd_settings.py.
+  - platform: template
+    id: auto_ctl
+    name: "Auto Control"
+    icon: mdi:robot
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_auto_ctl, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_auto_ctl, state: { checked: false } }
+  - platform: template
+    id: sw_observe
+    name: "Observe Only"
+    icon: mdi:eye
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_observe, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_observe, state: { checked: false } }
+  - platform: template
+    id: sw_rule_low
+    name: "Rule Low Battery"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_low, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_low, state: { checked: false } }
+  - platform: template
+    id: sw_rule_high
+    name: "Rule High Load"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_high, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_high, state: { checked: false } }
+  - platform: template
+    id: sw_rule_night
+    name: "Rule Night Load"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_night, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_night, state: { checked: false } }
+  - platform: template
+    id: sw_rule_ovn
+    name: "Rule Overnight"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_ovn, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_ovn, state: { checked: false } }
+  - platform: template
+    id: sw_rule_charge
+    name: "Charger Manager"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_charge, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_charge, state: { checked: false } }
+  - platform: template
+    id: sw_rule_float
+    name: "Rule Float Voltage"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_float, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_rule_float, state: { checked: false } }
+  - platform: template
+    id: sw_buzzer
+    name: "Buzzer"
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_buzzer, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_buzzer, state: { checked: false } }
+  - platform: template
+    id: sw_quiet
+    name: "Buzzer Quiet Hours"
+    icon: mdi:volume-off
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_quiet, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_quiet, state: { checked: false } }
+  - platform: template
+    id: sw_autobl
+    name: "Auto Brightness"
+    icon: mdi:brightness-auto
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_autobl, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_autobl, state: { checked: false } }
+  - platform: template
+    id: sw_touchdbg
+    name: "Touch Debug"
+    icon: mdi:gesture-tap
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_touchdbg, state: { checked: true } }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.widget.update: { id: lv_sw_touchdbg, state: { checked: false } }
+            - lvgl.widget.hide: touch_dot
+
+number:
+  # Generated from tools/cyd_settings.py. All settings are exposed to Home Assistant.
+  - platform: template
+    id: n_cloudy_kwh
+    name: "Cloudy Below"
+    entity_category: config
+    unit_of_measurement: "kWh"
+    mode: box
+    min_value: 0
+    max_value: 20
+    step: 0.5
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_cloudy_kwh, text: !lambda 'return str_sprintf("%.1f kWh", x);' }
+  - platform: template
+    id: n_sunny_sw
+    name: "Sunny Day Switch SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 16
+    max_value: 37
+    step: 1
+    initial_value: 18
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_sunny_sw, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_sunny_ret
+    name: "Sunny Day Return SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 25
+    max_value: 40
+    step: 1
+    initial_value: 25
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_sunny_ret, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_cloudy_sw
+    name: "Cloudy Day Switch SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 16
+    max_value: 37
+    step: 1
+    initial_value: 25
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_cloudy_sw, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_cloudy_ret
+    name: "Cloudy Day Return SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 25
+    max_value: 40
+    step: 1
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_cloudy_ret, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_chg_target
+    name: "Grid Charge Target"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 20
+    max_value: 80
+    step: 1
+    initial_value: 40
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_chg_target, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_chg_margin
+    name: "Grid Charge Restart Margin"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 3
+    max_value: 30
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_chg_margin, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_emerg_soc
+    name: "Emergency Charge Below"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 30
+    step: 1
+    initial_value: 15
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_emerg_soc, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_emerg_target
+    name: "Emergency Charge Target"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 15
+    max_value: 50
+    step: 1
+    initial_value: 25
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_emerg_target, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_fast_below
+    name: "Fast Charge Below"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 50
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_fast_below, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_chg_fast_a
+    name: "Fast Charge Current"
+    entity_category: config
+    unit_of_measurement: "A"
+    mode: box
+    min_value: 2
+    max_value: 60
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_chg_fast_a, text: !lambda 'return str_sprintf("%.0f A", x);' }
+  - platform: template
+    id: n_chg_norm_a
+    name: "Normal Charge Current"
+    entity_category: config
+    unit_of_measurement: "A"
+    mode: box
+    min_value: 2
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_chg_norm_a, text: !lambda 'return str_sprintf("%.0f A", x);' }
+  - platform: template
+    id: n_ovn_floor
+    name: "Overnight Floor SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 40
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_ovn_floor, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_ovn_margin
+    name: "Overnight Margin"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 1
+    max_value: 20
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_ovn_margin, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_base_floor
+    name: "Base Load Floor"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 50
+    max_value: 2000
+    step: 50
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_base_floor, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_sun_delay_sunny
+    name: "Sun Useful Delay Sunny"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: 0
+    max_value: 6
+    step: 0.5
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_sun_delay_sunny, text: !lambda 'return str_sprintf("%.1f h", x);' }
+  - platform: template
+    id: n_sun_delay_cloudy
+    name: "Sun Useful Delay Cloudy"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: 0
+    max_value: 8
+    step: 0.5
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_sun_delay_cloudy, text: !lambda 'return str_sprintf("%.1f h", x);' }
+  - platform: template
+    id: n_low_delay
+    name: "Low SOC Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0
+    max_value: 300
+    step: 5
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_low_delay, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_min_sub
+    name: "Min Time On Grid"
+    entity_category: config
+    unit_of_measurement: "min"
+    mode: box
+    min_value: 0
+    max_value: 30
+    step: 1
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_min_sub, text: !lambda 'return str_sprintf("%.0f min", x);' }
+  - platform: template
+    id: n_float_v
+    name: "Float Voltage Target"
+    entity_category: config
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 24
+    max_value: 29.2
+    step: 0.1
+    initial_value: 27
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_float_v, text: !lambda 'return str_sprintf("%.1f V", x);' }
+  - platform: template
+    id: n_high_on_w
+    name: "High Load On"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 1000
+    max_value: 4000
+    step: 100
+    initial_value: 2500
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_on_w, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_high_on_s
+    name: "High Load On Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_on_s, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_high_off_w
+    name: "High Load Off"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 500
+    max_value: 3500
+    step: 100
+    initial_value: 2000
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_off_w, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_high_off_s
+    name: "High Load Off Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 5
+    max_value: 300
+    step: 5
+    initial_value: 45
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_off_s, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_high_max_soc
+    name: "High Load Max SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 30
+    max_value: 100
+    step: 5
+    initial_value: 80
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_max_soc, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_high_max_pv
+    name: "High Load Max PV"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 0
+    max_value: 4000
+    step: 100
+    initial_value: 1200
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_high_max_pv, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_night_on_w
+    name: "Night Load On"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 500
+    max_value: 3000
+    step: 100
+    initial_value: 1600
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_night_on_w, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_night_on_s
+    name: "Night Load On Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0
+    max_value: 300
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_night_on_s, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_night_max_soc
+    name: "Night Max SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 30
+    max_value: 100
+    step: 5
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_night_max_soc, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_night_off_w
+    name: "Night Load Off"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 100
+    max_value: 2000
+    step: 50
+    initial_value: 600
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_night_off_w, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_night_off_s
+    name: "Night Load Off Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 10
+    max_value: 600
+    step: 10
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_night_off_s, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_back_soc
+    name: "Night Release SOC"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 30
+    max_value: 100
+    step: 5
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_back_soc, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_back_w
+    name: "Night Release Load"
+    entity_category: config
+    unit_of_measurement: "W"
+    mode: box
+    min_value: 200
+    max_value: 3000
+    step: 100
+    initial_value: 1000
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_back_w, text: !lambda 'return str_sprintf("%.0f W", x);' }
+  - platform: template
+    id: n_back_s
+    name: "Night Release Delay"
+    entity_category: config
+    unit_of_measurement: "s"
+    mode: box
+    min_value: 0
+    max_value: 120
+    step: 5
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_back_s, text: !lambda 'return str_sprintf("%.0f s", x);' }
+  - platform: template
+    id: n_batt_kwh
+    name: "Battery Capacity"
+    entity_category: config
+    unit_of_measurement: "kWh"
+    mode: box
+    min_value: 1
+    max_value: 30
+    step: 0.1
+    initial_value: 4.5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_batt_kwh, text: !lambda 'return str_sprintf("%.1f kWh", x);' }
+  - platform: template
+    id: n_empty_soc
+    name: "Battery Empty At"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 0
+    max_value: 30
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_empty_soc, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_pv_kwp
+    name: "PV Array Size"
+    entity_category: config
+    unit_of_measurement: "kWp"
+    mode: box
+    min_value: 0.5
+    max_value: 20
+    step: 0.1
+    initial_value: 2.0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_pv_kwp, text: !lambda 'return str_sprintf("%.1f kWp", x);' }
+  - platform: template
+    id: n_pv_tilt
+    name: "PV Tilt"
+    entity_category: config
+    unit_of_measurement: "°"
+    mode: box
+    min_value: 0
+    max_value: 90
+    step: 1
+    initial_value: 40
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_pv_tilt, text: !lambda 'return str_sprintf("%.0f°", x);' }
+  - platform: template
+    id: n_pv_az
+    name: "PV Azimuth"
+    entity_category: config
+    unit_of_measurement: "°"
+    mode: box
+    min_value: -180
+    max_value: 180
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_pv_az, text: !lambda 'return str_sprintf("%.0f°", x);' }
+  - platform: template
+    id: n_quiet_start
+    name: "Quiet Hours From"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 1
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_quiet_start, text: !lambda 'return str_sprintf("%02.0f:00", x);' }
+  - platform: template
+    id: n_quiet_end
+    name: "Quiet Hours Until"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 9
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_quiet_end, text: !lambda 'return str_sprintf("%02.0f:00", x);' }
+  - platform: template
+    id: n_bl_min
+    name: "Backlight Min (auto)"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - lvgl.label.update: { id: lb_n_bl_min, text: !lambda 'return str_sprintf("%.0f %%", x);' }
+  - platform: template
+    id: n_ldr_dark
+    name: "LDR Dark Reading"
+    entity_category: config
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 0
+    max_value: 1.2
+    step: 0.001
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: n_ldr_bright
+    name: "LDR Bright Reading"
+    entity_category: config
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 0
+    max_value: 1.2
+    step: 0.001
+    initial_value: 0.0
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: n_led_r
+    name: "LED Red Level"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: 'id(led_r).set_max_power(x / 100.0f);'
+  - platform: template
+    id: n_led_g
+    name: "LED Green Level"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: 'id(led_g).set_max_power(x / 100.0f);'
+  - platform: template
+    id: n_led_b
+    name: "LED Blue Level"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: box
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: 'id(led_b).set_max_power(x / 100.0f);'
+
+interval:
+  # No grid + low battery: alarm once below ${alarm_soc} %, then every 10 min below ${repeat_soc} %
+  - interval: 60s
+    then:
+      - lambda: |-
+          // @sim:alarm_soc
+          static uint32_t last = 0;
+          const float soc = id(s_soc).state;
+          const bool fresh = millis() - id(last_inverter_data) < 120000;
+          if (!id(bs_grid).has_state() || id(bs_grid).state || isnan(soc) || !fresh || soc >= ${alarm_soc}) {
+            if (soc >= ${alarm_soc} + 5 || (id(bs_grid).has_state() && id(bs_grid).state)) id(low_alarmed) = false;
+            return;
+          }
+          const uint32_t now = millis();
+          if (!id(low_alarmed) || (soc < ${repeat_soc} && now - last >= 600000)) {
+            id(low_alarmed) = true;
+            last = now;
+            id(play_tune).execute(std::string("alarm_no_grid"), 3, true);
+          }
+  # ---------------------------------------------------------------------------
+  # Controller v2 (handoff section 4). One writer per inverter setting: output priority and
+  # charger source / current are written only here. Rules only set reasons (latched).
+  # Reasons: LOW=1 HIGH=2 NIGHT=4 OVERNIGHT=8 CHARGE=16. Any reason -> SUB (grid), none -> SBU.
+  # ---------------------------------------------------------------------------
+  - interval: 2s
+    then:
+      - lambda: |-
+          // @sim:controller
+          const uint32_t now = millis();
+          if (now - id(boot_ms) < 30000) return;                 // let the inverter readings settle
+          if (!id(inv_link).state) return;                       // stale data: write nothing, keep latches
+          const float soc = id(s_soc).state, load = id(s_load_power).state, pv = id(s_pv_power).state;
+          id(load_acc) += load; id(load_cnt)++;                  // for the 1-minute load means
+          const bool grid = id(bs_grid).has_state() && id(bs_grid).state;
+          const auto t = id(sntp_time).now();
+          const bool time_ok = t.is_valid();                     // no clock -> time-based rules pause
+          const bool night = time_ok && id(sun_c).elevation() < -0.833;
+          const float sw = id(reserve_sw), ret = id(reserve_ret);
+          auto ms = [](float s) -> uint32_t { return (uint32_t) (s * 1000.0f); };
+          auto held = [&](uint32_t &since, bool cond, uint32_t dur) -> bool {   // cond true for dur ms
+            if (!cond) { since = 0; return false; }
+            if (since == 0) since = std::max<uint32_t>(now, 1);
+            return now - since >= dur;
+          };
+          static uint32_t t_low, t_ret, t_hi, t_hi_rel, t_ng, t_ng_rel, t_ng_rel2, t_ov, t_ov_rel, t_chg;
+          const uint8_t LOW = 1, HIGH = 2, NIGHT = 4, OVN = 8, CHG = 16;
+          uint8_t r = id(sub_reasons);
+
+          // ---- predicted SOC when the sun becomes useful (handoff 4D)
+          const float base = id(base_load);
+          const float delay_h = id(cloudy) ? id(n_sun_delay_cloudy).state : id(n_sun_delay_sunny).state;
+          const bool rise_known = time_ok && id(sunrise_ts) != 0 && t.timestamp >= id(sunrise_ts) &&
+                                  t.timestamp - id(sunrise_ts) < 2 * 86400;
+          float hrs = NAN;
+          bool sun_useful = false;
+          if (time_ok && !night) {
+            const float since_h = rise_known ? (t.timestamp - id(sunrise_ts)) / 3600.0f : 99.0f;
+            sun_useful = (!isnan(pv) && pv >= base) || since_h > delay_h;
+            hrs = sun_useful ? 0.0f : std::max(delay_h - since_h, 0.0f);
+          } else if (night && rise_known) {
+            uint32_t next = id(sunrise_ts);
+            while (next <= (uint32_t) t.timestamp) next += 86400;   // same time tomorrow (+-2 min)
+            hrs = (next - t.timestamp) / 3600.0f + delay_h;
+          }
+          const float soc_sun = isnan(hrs) ? NAN : soc - base * hrs / (id(n_batt_kwh).state * 10.0f);
+          id(soc_at_sun) = soc_sun;
+
+          // ---- LOW: below the planner's switch SOC -> grid; above its return SOC -> release
+          {
+            const uint32_t d = ms(id(n_low_delay).state);
+            const bool on = held(t_low, soc < sw, d), off = held(t_ret, soc > ret, d);
+            if (!id(sw_rule_low).state) r &= ~LOW;
+            else if (on) r |= LOW;
+            else if (off) r &= ~LOW;
+          }
+          // ---- HIGH: heavy load while SOC and PV are low
+          {
+            const bool on = held(t_hi, load > id(n_high_on_w).state && soc < id(n_high_max_soc).state &&
+                                       (isnan(pv) || pv < id(n_high_max_pv).state), ms(id(n_high_on_s).state));
+            const bool off = held(t_hi_rel, load < id(n_high_off_w).state, ms(id(n_high_off_s).state));
+            if (!id(sw_rule_high).state) r &= ~HIGH;
+            else if (on) r |= HIGH;
+            else if (off) r &= ~HIGH;
+          }
+          // ---- NIGHT: medium load at night with SOC below the night limit
+          {
+            const bool on = held(t_ng, night && load > id(n_night_on_w).state &&
+                                       soc < id(n_night_max_soc).state, ms(id(n_night_on_s).state));
+            const bool off1 = held(t_ng_rel, load < id(n_night_off_w).state && soc > ret, ms(id(n_night_off_s).state));
+            const bool off2 = held(t_ng_rel2, soc > id(n_back_soc).state && load < id(n_back_w).state,
+                                   ms(id(n_back_s).state));
+            if (!id(sw_rule_night).state || !time_ok) r &= ~NIGHT;
+            else if (on) r |= NIGHT;
+            else if (off1 || off2) r &= ~NIGHT;
+          }
+          // ---- OVERNIGHT: the battery would be too low when the sun becomes useful
+          {
+            const float target = std::max(id(n_ovn_floor).state, sw);
+            const bool on = held(t_ov, night && !isnan(soc_sun) && soc_sun < target, 5 * 60000);
+            const bool off = held(t_ov_rel, !isnan(soc_sun) && soc_sun > target + id(n_ovn_margin).state, 5 * 60000);
+            if (!id(sw_rule_ovn).state || !time_ok || isnan(soc_sun)) r &= ~OVN;
+            else if (on) r |= OVN;
+            else if (off || sun_useful) r &= ~OVN;
+          }
+          // ---- CHARGE: charger manager latch (handoff 4B)
+          const float emerg_t = id(n_emerg_target).state;
+          const float chg_t = id(cloudy) ? std::max(id(n_chg_target).state, emerg_t) : emerg_t;
+          {
+            const bool start = held(t_chg, grid && ((id(cloudy) && soc < id(n_chg_target).state - id(n_chg_margin).state) ||
+                                                    soc < id(n_emerg_soc).state), ms(id(n_low_delay).state));
+            const bool stop = !grid || soc >= chg_t;
+            if (!id(sw_rule_charge).state) id(charging) = false;
+            else id(charging) = start || (id(charging) && !stop);
+            if (id(charging) && grid && soc < chg_t) r |= CHG; else r &= ~CHG;
+          }
+          id(sub_reasons) = r;
+
+          // ---- output priority (handoff 4C): SUB at once, back to SBU only after the minimum time on
+          // SUB. State-based: write while the read-back differs, at most every 30 s; a write that
+          // has not taken after one retry raises the fault alarm (then retries every 5 min).
+          const bool want = r != 0;
+          id(want_sub) = want;
+          const float rb = id(s_output_source_priority).state;     // 0 USB, 1 SUB, 2 SBU
+          const bool is_sub = rb == 1.0f, is_sbu = rb == 2.0f;
+          if (!is_sub) id(sub_since) = 0;
+          else if (id(sub_since) == 0) id(sub_since) = std::max<uint32_t>(now, 1);
+          const bool min_ok = !is_sub || now - id(sub_since) >= (uint32_t) (id(n_min_sub).state * 60000.0f);
+          const bool active = id(auto_ctl).state && !id(sw_observe).state;
+          static uint32_t last_out = 0, last_chg_w = 0;
+          static uint8_t out_tries = 0, chg_tries = 0;
+          const bool out_bad = want ? !is_sub : !is_sbu;
+          if (!active || !out_bad) out_tries = 0;
+          else if (want || min_ok) {
+            const uint32_t gap = out_tries >= 2 ? 300000 : 30000;
+            if (last_out == 0 || now - last_out >= gap) {
+              if (out_tries == 2 && !id(ctl_fault)) {
+                id(ctl_fault) = true;
+                id(notify).execute(std::string("Inverter did not accept the output priority"));
+                id(play_tune).execute(std::string("alarm_no_grid"), 3, true);
+              }
+              if (want && is_sbu && grid && out_tries == 0 && (r & ~CHG))   // routine charging: no tune
+                id(play_tune).execute(std::string((r & LOW) ? "to_grid_low" : "to_grid"), (r & LOW) ? 2 : 1, false);
+              if (want && (r & LOW) && out_tries == 0) id(notify).execute(std::string("Battery low - switched to grid"));
+              id(sel_output_source_priority).make_call().set_option(want ? "Solar first (SUB)" : "Battery first (SBU)").perform();
+              ESP_LOGW("ctl", "priority -> %s (reasons=0x%02X soc=%.0f load=%.0f reserve %.0f/%.0f try %u)",
+                       want ? "SUB" : "SBU", r, soc, load, sw, ret, out_tries + 1);
+              last_out = now;
+              if (out_tries < 2) out_tries++;
+            }
+          }
+
+          // ---- charger source + AC charge current (only writer): solar only, unless charging
+          bool chg_bad = false;
+          if (id(sw_rule_charge).state) {
+            const float src_v = id(charging) ? 2.0f : 3.0f;      // 2 = solar and utility, 3 = solar only
+            const float want_a = (id(charging) && soc < id(n_fast_below).state) ? id(n_chg_fast_a).state
+                                                                                : id(n_chg_norm_a).state;
+            static const int opts[] = {2, 10, 20, 30, 40, 50, 60};
+            int best = 0;
+            for (int i = 1; i < 7; i++)
+              if (fabsf(opts[i] - want_a) < fabsf(opts[best] - want_a)) best = i;
+            const bool src_bad = id(s_charger_source_priority).state != src_v;
+            const bool cur_bad = (int) id(s_max_ac_charging_current).state != opts[best];
+            chg_bad = src_bad || cur_bad;
+            if (!active || !chg_bad) chg_tries = 0;
+            else if (last_chg_w == 0 || now - last_chg_w >= (chg_tries >= 2 ? 300000u : 30000u)) {
+              if (chg_tries == 2 && !id(ctl_fault)) {
+                id(ctl_fault) = true;
+                id(notify).execute(std::string("Inverter did not accept the charger setting"));
+              }
+              if (src_bad) id(sel_charger_source_priority).make_call().set_option(id(charging) ? "Solar and utility" : "Solar only").perform();
+              else id(sel_max_ac_charging_current).make_call().set_option(to_string(opts[best])).perform();
+              ESP_LOGW("ctl", "charger -> %s %d A (soc=%.0f)", id(charging) ? "solar+utility" : "solar only", opts[best], soc);
+              last_chg_w = now;
+              if (chg_tries < 2) chg_tries++;
+            }
+          }
+          if (id(ctl_fault) && !out_bad && !chg_bad) id(ctl_fault) = false;
+
+  # Planner + load statistics, every minute (handoff 4A, section 5)
+  - interval: 60s
+    then:
+      - lambda: |-
+          // @sim:planner
+          // 3 h median of one-minute load means (no data = no sample)
+          if (id(load_cnt) > 0) {
+            id(load_ring)[id(load_pos)] = (uint16_t) std::min(65535.0f, std::max(0.0f, id(load_acc) / id(load_cnt)));
+            id(load_pos) = (id(load_pos) + 1) % 180;
+            if (id(load_n) < 180) id(load_n)++;
+            id(load_acc) = 0; id(load_cnt) = 0;
+          }
+          const auto &ring = id(load_ring);
+          if (id(load_n) >= 30) {
+            std::vector<uint16_t> v(ring.begin(), ring.begin() + id(load_n));
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            id(load_median) = v[v.size() / 2];
+          }
+          if (id(load_n) >= 5) {
+            float sum = 0;
+            for (int i = 1; i <= 5; i++) sum += ring[(id(load_pos) + 180 - i) % 180];
+            id(load_mean5) = sum / 5;
+          }
+          id(base_load) = std::max(isnan(id(load_median)) ? 0.0f : id(load_median), id(n_base_floor).state);
+
+          // sunrise = sun crossing -0.833 deg upward (for the "since sunrise" rules)
+          const auto t = id(sntp_time).now();
+          static float prev_el = NAN;
+          if (t.is_valid()) {
+            const float el = id(sun_c).elevation();
+            if (!isnan(prev_el) && prev_el < -0.833f && el >= -0.833f) id(sunrise_ts) = t.timestamp;
+            prev_el = el;
+          }
+
+          // reserve planner: forecast for the coming day; afternoon -> tomorrow
+          float fc = (t.is_valid() && t.hour >= 12) ? id(fc_tomorrow_kwh) : id(fc_today_kwh);
+          if (isnan(fc))   // no internet: persistence (today so far after 15:00, else yesterday)
+            fc = (t.is_valid() && t.hour >= 15) ? id(e_solar_today).state : id(sol_yday_kwh);
+          const bool cl = isnan(fc) || fc < id(n_cloudy_kwh).state;   // unknown counts as cloudy
+          id(plan_fc) = fc;
+          id(cloudy) = cl;
+          const float sw = std::clamp(cl ? id(n_cloudy_sw).state : id(n_sunny_sw).state, 16.0f, 37.0f);
+          const float ret = std::min(std::max({cl ? id(n_cloudy_ret).state : id(n_sunny_ret).state, sw + 3.0f, 25.0f}), 40.0f);
+          id(reserve_sw) = sw;
+          id(reserve_ret) = ret;
+
+  # Battery runtime / morning alarms without grid (handoff 4E, 4G), at most every 30 min each
+  - interval: 60s
+    then:
+      - lambda: |-
+          // @sim:alarms
+          const uint32_t now = millis();
+          static uint32_t t_rb, t_rn, t_mw, last_rt, last_mw;
+          auto held = [&](uint32_t &since, bool cond, uint32_t dur) -> bool {
+            if (!cond) { since = 0; return false; }
+            if (since == 0) since = std::max<uint32_t>(now, 1);
+            return now - since >= dur;
+          };
+          const bool no_grid = id(bs_grid).has_state() && !id(bs_grid).state;
+          if (!id(inv_link).state || !no_grid) { t_rb = t_rn = t_mw = 0; return; }
+          const float soc = id(s_soc).state;
+          const float usable = std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state));
+          const float rt_base = usable / id(base_load);
+          const float rt_now = isnan(id(load_mean5)) ? NAN : usable / std::max(id(load_mean5), 50.0f);
+          const bool b = held(t_rb, rt_base < 2.0f, 120000);
+          const bool n = held(t_rn, !isnan(rt_now) && rt_now < 0.5f, 300000);
+          if ((b || n) && (last_rt == 0 || now - last_rt >= 1800000)) {
+            last_rt = now;
+            id(notify).execute(str_sprintf("No grid: battery for about %.1f h", std::min(rt_base, isnan(rt_now) ? rt_base : rt_now)));
+            id(play_tune).execute(std::string("alarm_no_grid"), 3, true);
+          }
+          if (held(t_mw, !isnan(id(soc_at_sun)) && id(soc_at_sun) < id(n_ovn_floor).state, 300000) &&
+              (last_mw == 0 || now - last_mw >= 1800000)) {
+            last_mw = now;
+            id(notify).execute(str_sprintf("No grid: battery may run out before sunrise (%.0f %%)", id(soc_at_sun)));
+            id(play_tune).execute(std::string("warn_morning"), 3, true);
+          }
+
+  # Forecast refresh: every 2 h, or every 15 min until the first good fetch.
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (millis() < 60000 || id(fetch_forecast).is_running()) return false;
+              if (!wifi::global_wifi_component->is_connected() || !id(sntp_time).now().is_valid()) return false;
+              uint32_t wait = id(fc_updated).empty() ? 15UL * 60000UL : 2UL * 3600000UL;
+              return id(fc_last_try) == 0 || millis() - id(fc_last_try) >= wait;
+          then:
+            - lambda: 'id(fc_last_try) = millis();'
+            - script.execute: fetch_forecast
+
+  # Status LED: green ok, blue = no WiFi, red blink = no inverter data, amber = on grid
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(led_test)) return;               // boot / button self-test owns the LED
+          static bool blink = false; blink = !blink;
+          const bool inv_ok = id(inv_link).state;
+          const bool net_ok = wifi::global_wifi_component->is_connected();
+          float rr = 0, gg = 0, bb = 0;
+          if (!inv_ok)            { rr = blink ? 1 : 0; }
+          else if (!net_ok)       { bb = 1; }
+          else if (id(sub_reasons)) { rr = 1; gg = 0.35; }
+          else                    { gg = 1; }
+          if (rr == 0 && gg == 0 && bb == 0) {
+            // really off: an "on" light with RGB 0,0,0 is shown as white by ESPHome
+            auto off = id(status_led).turn_off();
+            off.set_transition_length(0);
+            off.perform();
+            return;
+          }
+          auto call = id(status_led).turn_on();
+          call.set_rgb(rr, gg, bb);
+          call.set_brightness(1.0);             // always full; balance colours with LED * Level
+          call.set_transition_length(0);
+          call.perform();
+
+  # Screen refresh
+  - interval: 2s
+    then:
+      # No fresh inverter data -> every inverter value shows N/A (not the last value).
+      - lvgl.label.update:
+          id: lbl_soc
+          text: !lambda |-
+            float v = id(s_soc).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f%%", v);
+      - lvgl.arc.update:
+          id: arc_soc
+          value: !lambda 'return (!id(inv_link).state || isnan(id(s_soc).state)) ? 0 : (int) id(s_soc).state;'
+      - script.execute: ui_refresh_values
+      # Status icons: green = OK, red = down
+      - lvgl.label.update:
+          id: ic_inv
+          text_color: !lambda 'return lv_color_hex(id(inv_link).state ? 0x43A047 : 0xE53935);'
+      - lvgl.label.update:
+          id: ic_ha
+          text_color: !lambda 'return lv_color_hex(api::global_api_server->is_connected() ? 0x43A047 : 0xE53935);'
+      - lvgl.label.update:
+          id: ic_wifi
+          text_color: !lambda 'return lv_color_hex(wifi::global_wifi_component->is_connected() ? 0x43A047 : 0xE53935);'
+      - lvgl.label.update:
+          id: lbl_mode
+          text: !lambda |-
+            if (!id(inv_link).state) return std::string("No inverter data");
+            static const char *names[] = {"USB", "SUB grid", "SBU battery"};
+            const float v = id(s_output_source_priority).state;
+            std::string m = isnan(v) ? "?" : names[(int) v % 3];
+            const uint8_t r = id(sub_reasons);
+            std::string why;
+            if (r & 1) why += " LOW";
+            if (r & 2) why += " HIGH";
+            if (r & 4) why += " NIGHT";
+            if (r & 8) why += " OVN";
+            if (r & 16) why += " CHG";
+            if (!id(auto_ctl).state) return m + " | MANUAL";
+            if (id(sw_observe).state) return std::string("OBSERVE: ") + (id(want_sub) ? "SUB" : "SBU") + why;
+            if (id(ctl_fault)) return m + " | FAULT";
+            return m + why;
+      - lvgl.label.update:
+          id: lbl_status
+          text: !lambda |-
+            auto t = id(sntp_time).now();
+            std::string s = t.is_valid() ? t.strftime("%H:%M") : std::string("--:--");
+            s += str_sprintf("  %.0f/%.0f%%", id(reserve_sw), id(reserve_ret));
+            s += isnan(id(soc_at_sun)) ? std::string("  sun --") : str_sprintf("  sun %.0f%%", id(soc_at_sun));
+            return s;
+      - lvgl.label.update:
+          id: lbl_ctl_state
+          text: !lambda |-
+            if (!id(inv_link).state) return std::string("No inverter data");
+            static const char *out[] = {"USB", "SUB", "SBU"};
+            const float o = id(s_output_source_priority).state;
+            std::string s = std::string("Inverter ") + (isnan(o) ? "N/A" : out[(int) o % 3]);
+            s += std::string(", plan ") + (id(want_sub) ? "SUB" : "SBU");
+            return s + (id(cloudy) ? ", cloudy" : ", sunny");
+      - lvgl.label.update:
+          id: lbl_chg_state
+          text: !lambda |-
+            if (!id(sw_rule_charge).state) return std::string("Charger manager off");
+            const float a = id(s_max_ac_charging_current).state;
+            if (id(charging)) return str_sprintf("Grid charging, %.0f A", a);
+            return std::string("Solar only") + (isnan(a) ? "" : str_sprintf(", %.0f A", a));
+      - lvgl.label.update:
+          id: lbl_ldr
+          text: !lambda 'return isnan(id(s_ldr).state) ? std::string("--") : str_sprintf("%.3f V", id(s_ldr).state);'
+      - lvgl.label.update:
+          id: lbl_ldr_cal
+          text: !lambda |-
+            return str_sprintf("calibrated: dark %.3f V, bright %.3f V", id(n_ldr_dark).state, id(n_ldr_bright).state);
+      # Auto brightness follows the room while the screen is in use (idle dimming still wins)
+      - if:
+          condition:
+            and:
+              - switch.is_on: sw_autobl
+              - light.is_on: backlight
+              - not:
+                  lvgl.is_idle: { timeout: 90s }
+          then:
+            - lambda: |-
+                float t = id(bl_target).state;
+                if (fabsf(id(backlight).current_values.get_brightness() - t) > 0.04f) {
+                  auto c = id(backlight).turn_on();
+                  c.set_brightness(t);
+                  c.set_transition_length(1000);
+                  c.perform();
+                }
+
+# -----------------------------------------------------------------------------
+# SCRIPTS
+# -----------------------------------------------------------------------------
+script:
+  # LED self-test / calibration: 1 s red, 1 s green, 1 s blue, 2 s off, then normal status.
+  # Runs at boot and from the "LED Test" button.
+  - id: led_selftest
+    mode: restart
+    then:
+      - lambda: 'id(led_test) = true;'
+      - light.turn_on: { id: status_led, red: 100%, green: 0%, blue: 0%, brightness: 100%, transition_length: 0s }
+      - delay: 1s
+      - light.turn_on: { id: status_led, red: 0%, green: 100%, blue: 0%, brightness: 100%, transition_length: 0s }
+      - delay: 1s
+      - light.turn_on: { id: status_led, red: 0%, green: 0%, blue: 100%, brightness: 100%, transition_length: 0s }
+      - delay: 1s
+      - light.turn_off: { id: status_led, transition_length: 0s }
+      - delay: 2s
+      - lambda: 'id(led_test) = false;'
+
+  # Advanced 8/8 'Restore defaults' (tap twice). Values = each entity's initial_value /
+  # restore_mode default. Keeps touch orientation and light-sensor calibration.
+  - id: restore_defaults
+    then:
+      - number.set: { id: n_cloudy_kwh, value: 5 }
+      - number.set: { id: n_sunny_sw, value: 18 }
+      - number.set: { id: n_sunny_ret, value: 25 }
+      - number.set: { id: n_cloudy_sw, value: 25 }
+      - number.set: { id: n_cloudy_ret, value: 30 }
+      - number.set: { id: n_chg_target, value: 40 }
+      - number.set: { id: n_chg_margin, value: 10 }
+      - number.set: { id: n_emerg_soc, value: 15 }
+      - number.set: { id: n_emerg_target, value: 25 }
+      - number.set: { id: n_fast_below, value: 20 }
+      - number.set: { id: n_chg_fast_a, value: 20 }
+      - number.set: { id: n_chg_norm_a, value: 10 }
+      - number.set: { id: n_ovn_floor, value: 10 }
+      - number.set: { id: n_ovn_margin, value: 5 }
+      - number.set: { id: n_base_floor, value: 300 }
+      - number.set: { id: n_sun_delay_sunny, value: 1.5 }
+      - number.set: { id: n_sun_delay_cloudy, value: 3 }
+      - number.set: { id: n_low_delay, value: 60 }
+      - number.set: { id: n_min_sub, value: 3 }
+      - number.set: { id: n_float_v, value: 27 }
+      - number.set: { id: n_high_on_w, value: 2500 }
+      - number.set: { id: n_high_on_s, value: 6 }
+      - number.set: { id: n_high_off_w, value: 2000 }
+      - number.set: { id: n_high_off_s, value: 45 }
+      - number.set: { id: n_high_max_soc, value: 80 }
+      - number.set: { id: n_high_max_pv, value: 1200 }
+      - number.set: { id: n_night_on_w, value: 1600 }
+      - number.set: { id: n_night_on_s, value: 30 }
+      - number.set: { id: n_night_max_soc, value: 70 }
+      - number.set: { id: n_night_off_w, value: 600 }
+      - number.set: { id: n_night_off_s, value: 60 }
+      - number.set: { id: n_back_soc, value: 60 }
+      - number.set: { id: n_back_w, value: 1000 }
+      - number.set: { id: n_back_s, value: 10 }
+      - number.set: { id: n_batt_kwh, value: 4.5 }
+      - number.set: { id: n_empty_soc, value: 5 }
+      - number.set: { id: n_pv_kwp, value: 2.0 }
+      - number.set: { id: n_pv_tilt, value: 40 }
+      - number.set: { id: n_pv_az, value: 0 }
+      - number.set: { id: n_quiet_start, value: 1 }
+      - number.set: { id: n_quiet_end, value: 9 }
+      - number.set: { id: n_bl_min, value: 20 }
+      - switch.turn_on: auto_ctl
+      - switch.turn_on: sw_observe
+      - switch.turn_on: sw_rule_low
+      - switch.turn_on: sw_rule_high
+      - switch.turn_on: sw_rule_night
+      - switch.turn_on: sw_rule_ovn
+      - switch.turn_on: sw_rule_charge
+      - switch.turn_on: sw_rule_float
+      - switch.turn_on: sw_buzzer
+      - switch.turn_on: sw_quiet
+      - switch.turn_off: sw_autobl
+      - switch.turn_off: sw_touchdbg
+
+  # Home / Power / Info value chips. Generated by ui.py. N/A when there is no fresh inverter data.
+  - id: ui_refresh_values
+    then:
+      - lvgl.label.update:
+          id: v_load
+          text: !lambda |-
+            float v = id(s_load_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: v_pv
+          text: !lambda |-
+            float v = id(s_pv_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: v_batt
+          text: !lambda |-
+            float v = id(s_soc).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f %%", v);
+      - lvgl.label.update:
+          id: v_grid
+          text: !lambda |-
+            float v = id(grid_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: p_pv
+          text: !lambda |-
+            float v = id(s_pv_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: p_load
+          text: !lambda |-
+            float v = id(s_load_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: p_batt
+          text: !lambda |-
+            float v = id(batt_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%+.0f W", v);
+      - lvgl.label.update:
+          id: p_grid
+          text: !lambda |-
+            float v = id(grid_power).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: p_solar
+          text: !lambda |-
+            float v = id(e_solar_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.label.update:
+          id: p_bv
+          text: !lambda |-
+            float v = id(s_batt_v).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.1f V", v);
+      - lvgl.label.update:
+          id: p_soc
+          text: !lambda |-
+            float v = id(s_soc).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f %%", v);
+      - lvgl.label.update:
+          id: p_gv
+          text: !lambda |-
+            float v = id(s_grid_v).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f V", v);
+      - lvgl.label.update:
+          id: p_temp
+          text: !lambda |-
+            float v = id(s_heatsink).state;
+            return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f °C", v);
+      - lvgl.label.update:
+          id: i_rssi
+          text: !lambda |-
+            float v = id(s_rssi).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.0f dBm", v);
+      - lvgl.label.update:
+          id: e_solar
+          text: !lambda |-
+            float v = id(e_solar_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.label.update:
+          id: e_load
+          text: !lambda |-
+            float v = id(e_load_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.label.update:
+          id: e_grid
+          text: !lambda |-
+            float v = id(e_grid_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.label.update:
+          id: e_chg
+          text: !lambda |-
+            float v = id(e_chg_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.label.update:
+          id: e_dis
+          text: !lambda |-
+            float v = id(e_dis_today).state;
+            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
+      - lvgl.arc.update:
+          id: arc_pv
+          value: !lambda 'float v = id(s_pv_power).state / std::max(0.1f, id(n_pv_kwp).state) / 10.0f; return (!id(inv_link).state || isnan(v)) ? 0 : (int) v;'
+      - lvgl.arc.update:
+          id: arc_load
+          value: !lambda 'float v = id(s_load_power).state; return (!id(inv_link).state || isnan(v)) ? 0 : (int) v;'
+      - lvgl.label.update:
+          id: lbl_age
+          text: !lambda |-
+            if (id(last_inverter_data) == 0) return std::string("never");
+            return str_sprintf("%us", (unsigned) ((millis() - id(last_inverter_data)) / 1000));
+      - lvgl.label.update:
+          id: x_left
+          text: !lambda |-
+            float soc = id(s_soc).state;
+            if (!id(inv_link).state || isnan(soc)) return std::string("N/A");
+            return str_sprintf("%.2f kWh", std::max(0.0f, id(n_batt_kwh).state * (soc - id(n_empty_soc).state) / 100.0f));
+      - lvgl.label.update:
+          id: x_rt_now
+          text: !lambda |-
+            float soc = id(s_soc).state, load = id(s_load_power).state;
+            if (!id(inv_link).state || isnan(soc) || isnan(load)) return std::string("N/A");
+            float wh = std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state));
+            float h = wh / std::max(load, 50.0f);
+            if (h >= 99.0f) return std::string("> 99 h");
+            return str_sprintf("%dh %02dm", (int) h, (int) ((h - (int) h) * 60));
+      - lvgl.label.update:
+          id: x_rt_1h
+          text: !lambda |-
+            float soc = id(s_soc).state, load = id(s_load_1h).state;
+            if (!id(inv_link).state || isnan(soc) || isnan(load)) return std::string("N/A");
+            float wh = std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state));
+            float h = wh / std::max(load, 50.0f);
+            if (h >= 99.0f) return std::string("> 99 h");
+            return str_sprintf("%dh %02dm", (int) h, (int) ((h - (int) h) * 60));
+      - lvgl.label.update:
+          id: x_fc_now
+          text: !lambda |-
+            const auto &c = id(fc_curve);
+            auto t = id(sntp_time).now();
+            if (c.empty() || !t.is_valid()) return std::string("N/A");
+            int m = t.hour * 60 + t.minute;
+            float v = 0;  // before the first / after the last point of the day = night
+            for (size_t i = 1; i < c.size(); i++) {
+              if (m >= c[i - 1].first && m <= c[i].first) {
+                float f = float(m - c[i - 1].first) / std::max(1, c[i].first - c[i - 1].first);
+                v = c[i - 1].second + f * (c[i].second - c[i - 1].second);
+                break;
+              }
+            }
+            return str_sprintf("%.0f W", v);
+      - lvgl.label.update:
+          id: x_fc_today
+          text: !lambda |-
+            float v = id(fc_today_kwh);
+            return isnan(v) ? std::string("N/A") : str_sprintf("%.1f kWh", v);
+      - lvgl.label.update:
+          id: x_fc_tmrw
+          text: !lambda |-
+            float v = id(fc_tomorrow_kwh);
+            return isnan(v) ? std::string("N/A") : str_sprintf("%.1f kWh", v);
+      - lvgl.label.update:
+          id: lbl_fc_upd
+          text: !lambda |-
+            return id(fc_updated).empty() ? std::string("not fetched") : "updated " + id(fc_updated);
+      - lvgl.label.update:
+          id: i_fw
+          text: !lambda |-
+            return std::string("ESPHome " ESPHOME_VERSION);
+      - lvgl.label.update:
+          id: i_built
+          text: !lambda |-
+            return std::string(__DATE__ " " __TIME__);
+      - lvgl.label.update:
+          id: i_wifi
+          text: !lambda |-
+            return id(t_ssid).has_state() ? id(t_ssid).state : std::string("--");
+      - lvgl.label.update:
+          id: i_ip
+          text: !lambda |-
+            return id(t_ip).has_state() ? id(t_ip).state : std::string("--");
+      - lvgl.label.update:
+          id: i_up
+          text: !lambda |-
+            uint32_t s = millis() / 1000;
+            return str_sprintf("%ud %02uh %02um", s / 86400, (s / 3600) % 24, (s / 60) % 60);
+      - lvgl.label.update:
+          id: i_mem
+          text: !lambda |-
+            return str_sprintf("free %u KB, block %u KB", (unsigned) (heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),
+                               (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024));
+
+  - id: play_tune
+    mode: queued
+    max_runs: 4
+    parameters:
+      tune: string
+      prio: int
+      critical: bool
+    then:
+      - lambda: |-
+          // @sim:play_tune
+          if (!id(sw_buzzer).state) return;
+          auto t = id(sntp_time).now();
+          if (!critical && id(sw_quiet).state && !t.is_valid()) return;   // clock unknown: might be night
+          if (!critical && id(sw_quiet).state && t.is_valid()) {
+            const int s = (int) id(n_quiet_start).state, e = (int) id(n_quiet_end).state, h = t.hour;
+            const bool quiet = s <= e ? (h >= s && h < e) : (h >= s || h < e);
+            if (quiet) return;
+          }
+          if (id(buzzer).is_playing() && prio <= id(tune_prio)) return;
+          const char *r = nullptr;
+          if (tune == "grid_lost")          r = "gridlost:d=8,o=6,b=140:e,c,4a5";
+          else if (tune == "grid_back")     r = "gridback:d=8,o=5,b=150:a,c6,4e6";
+          else if (tune == "to_grid_low")   r = "togridlow:d=8,o=6,b=125:e,4c,p,e,4c";
+          else if (tune == "to_grid")       r = "togrid:d=8,o=6,b=125:e,4c";
+          else if (tune == "alarm_no_grid") r = "alarm:d=16,o=6,b=180:a,e,a,e,a,e,8p,a,e,a,e,a,e,8p,a,e,a,e,a,e";
+          else if (tune == "warn_morning")  r = "morning:d=8,o=5,b=110:c6,p,g,p,e,p,4c,4p,c6,p,g,p,e,p,4c";
+          else if (tune == "test")          r = "test:d=16,o=6,b=160:c,e,g,c7,8p,g,4c7";
+          if (r == nullptr) { ESP_LOGW("buzzer", "unknown tune %s", tune.c_str()); return; }
+          if (id(buzzer).is_playing()) id(buzzer).stop();
+          id(tune_prio) = prio;
+          id(buzzer).play(r);
+  - id: ui_sync_all
+    then:
+      - lvgl.label.update: { id: lb_n_cloudy_kwh, text: !lambda 'return str_sprintf("%.1f kWh", id(n_cloudy_kwh).state);' }
+      - lvgl.label.update: { id: lb_n_sunny_sw, text: !lambda 'return str_sprintf("%.0f %%", id(n_sunny_sw).state);' }
+      - lvgl.label.update: { id: lb_n_sunny_ret, text: !lambda 'return str_sprintf("%.0f %%", id(n_sunny_ret).state);' }
+      - lvgl.label.update: { id: lb_n_cloudy_sw, text: !lambda 'return str_sprintf("%.0f %%", id(n_cloudy_sw).state);' }
+      - lvgl.label.update: { id: lb_n_cloudy_ret, text: !lambda 'return str_sprintf("%.0f %%", id(n_cloudy_ret).state);' }
+      - lvgl.label.update: { id: lb_n_chg_target, text: !lambda 'return str_sprintf("%.0f %%", id(n_chg_target).state);' }
+      - lvgl.label.update: { id: lb_n_chg_margin, text: !lambda 'return str_sprintf("%.0f %%", id(n_chg_margin).state);' }
+      - lvgl.label.update: { id: lb_n_emerg_soc, text: !lambda 'return str_sprintf("%.0f %%", id(n_emerg_soc).state);' }
+      - lvgl.label.update: { id: lb_n_emerg_target, text: !lambda 'return str_sprintf("%.0f %%", id(n_emerg_target).state);' }
+      - lvgl.label.update: { id: lb_n_fast_below, text: !lambda 'return str_sprintf("%.0f %%", id(n_fast_below).state);' }
+      - lvgl.label.update: { id: lb_n_chg_fast_a, text: !lambda 'return str_sprintf("%.0f A", id(n_chg_fast_a).state);' }
+      - lvgl.label.update: { id: lb_n_chg_norm_a, text: !lambda 'return str_sprintf("%.0f A", id(n_chg_norm_a).state);' }
+      - lvgl.label.update: { id: lb_n_ovn_floor, text: !lambda 'return str_sprintf("%.0f %%", id(n_ovn_floor).state);' }
+      - lvgl.label.update: { id: lb_n_ovn_margin, text: !lambda 'return str_sprintf("%.0f %%", id(n_ovn_margin).state);' }
+      - lvgl.label.update: { id: lb_n_base_floor, text: !lambda 'return str_sprintf("%.0f W", id(n_base_floor).state);' }
+      - lvgl.label.update: { id: lb_n_sun_delay_sunny, text: !lambda 'return str_sprintf("%.1f h", id(n_sun_delay_sunny).state);' }
+      - lvgl.label.update: { id: lb_n_sun_delay_cloudy, text: !lambda 'return str_sprintf("%.1f h", id(n_sun_delay_cloudy).state);' }
+      - lvgl.label.update: { id: lb_n_low_delay, text: !lambda 'return str_sprintf("%.0f s", id(n_low_delay).state);' }
+      - lvgl.label.update: { id: lb_n_min_sub, text: !lambda 'return str_sprintf("%.0f min", id(n_min_sub).state);' }
+      - lvgl.label.update: { id: lb_n_float_v, text: !lambda 'return str_sprintf("%.1f V", id(n_float_v).state);' }
+      - lvgl.label.update: { id: lb_n_high_on_w, text: !lambda 'return str_sprintf("%.0f W", id(n_high_on_w).state);' }
+      - lvgl.label.update: { id: lb_n_high_on_s, text: !lambda 'return str_sprintf("%.0f s", id(n_high_on_s).state);' }
+      - lvgl.label.update: { id: lb_n_high_off_w, text: !lambda 'return str_sprintf("%.0f W", id(n_high_off_w).state);' }
+      - lvgl.label.update: { id: lb_n_high_off_s, text: !lambda 'return str_sprintf("%.0f s", id(n_high_off_s).state);' }
+      - lvgl.label.update: { id: lb_n_high_max_soc, text: !lambda 'return str_sprintf("%.0f %%", id(n_high_max_soc).state);' }
+      - lvgl.label.update: { id: lb_n_high_max_pv, text: !lambda 'return str_sprintf("%.0f W", id(n_high_max_pv).state);' }
+      - lvgl.label.update: { id: lb_n_night_on_w, text: !lambda 'return str_sprintf("%.0f W", id(n_night_on_w).state);' }
+      - lvgl.label.update: { id: lb_n_night_on_s, text: !lambda 'return str_sprintf("%.0f s", id(n_night_on_s).state);' }
+      - lvgl.label.update: { id: lb_n_night_max_soc, text: !lambda 'return str_sprintf("%.0f %%", id(n_night_max_soc).state);' }
+      - lvgl.label.update: { id: lb_n_night_off_w, text: !lambda 'return str_sprintf("%.0f W", id(n_night_off_w).state);' }
+      - lvgl.label.update: { id: lb_n_night_off_s, text: !lambda 'return str_sprintf("%.0f s", id(n_night_off_s).state);' }
+      - lvgl.label.update: { id: lb_n_back_soc, text: !lambda 'return str_sprintf("%.0f %%", id(n_back_soc).state);' }
+      - lvgl.label.update: { id: lb_n_back_w, text: !lambda 'return str_sprintf("%.0f W", id(n_back_w).state);' }
+      - lvgl.label.update: { id: lb_n_back_s, text: !lambda 'return str_sprintf("%.0f s", id(n_back_s).state);' }
+      - lvgl.label.update: { id: lb_n_batt_kwh, text: !lambda 'return str_sprintf("%.1f kWh", id(n_batt_kwh).state);' }
+      - lvgl.label.update: { id: lb_n_empty_soc, text: !lambda 'return str_sprintf("%.0f %%", id(n_empty_soc).state);' }
+      - lvgl.label.update: { id: lb_n_pv_kwp, text: !lambda 'return str_sprintf("%.1f kWp", id(n_pv_kwp).state);' }
+      - lvgl.label.update: { id: lb_n_pv_tilt, text: !lambda 'return str_sprintf("%.0f°", id(n_pv_tilt).state);' }
+      - lvgl.label.update: { id: lb_n_pv_az, text: !lambda 'return str_sprintf("%.0f°", id(n_pv_az).state);' }
+      - lvgl.label.update: { id: lb_n_quiet_start, text: !lambda 'return str_sprintf("%02.0f:00", id(n_quiet_start).state);' }
+      - lvgl.label.update: { id: lb_n_quiet_end, text: !lambda 'return str_sprintf("%02.0f:00", id(n_quiet_end).state);' }
+      - lvgl.label.update: { id: lb_n_bl_min, text: !lambda 'return str_sprintf("%.0f %%", id(n_bl_min).state);' }
+      - lvgl.widget.update: { id: lv_auto_ctl, state: { checked: !lambda 'return id(auto_ctl).state;' } }
+      - lvgl.widget.update: { id: lv_sw_observe, state: { checked: !lambda 'return id(sw_observe).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_low, state: { checked: !lambda 'return id(sw_rule_low).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_high, state: { checked: !lambda 'return id(sw_rule_high).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_night, state: { checked: !lambda 'return id(sw_rule_night).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_ovn, state: { checked: !lambda 'return id(sw_rule_ovn).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_charge, state: { checked: !lambda 'return id(sw_rule_charge).state;' } }
+      - lvgl.widget.update: { id: lv_sw_rule_float, state: { checked: !lambda 'return id(sw_rule_float).state;' } }
+      - lvgl.widget.update: { id: lv_sw_buzzer, state: { checked: !lambda 'return id(sw_buzzer).state;' } }
+      - lvgl.widget.update: { id: lv_sw_quiet, state: { checked: !lambda 'return id(sw_quiet).state;' } }
+      - lvgl.widget.update: { id: lv_sw_autobl, state: { checked: !lambda 'return id(sw_autobl).state;' } }
+      - lvgl.widget.update: { id: lv_sw_touchdbg, state: { checked: !lambda 'return id(sw_touchdbg).state;' } }
+
+
+  # Forecast.Solar (free API, plain HTTPS GET). Day totals for today + tomorrow, then today's
+  # power curve for "solar now". Panel plane comes from the Solar panels settings.
+  - id: fetch_forecast
+    mode: single
+    then:
+      # Skip (forecast stays unknown = treated as cloudy) unless there is room for TLS.
+      - if:
+          condition:
+            lambda: |-
+              size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+              size_t fre = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+              if (blk < 24000 || fre < 45000) {
+                ESP_LOGW("fc", "skip forecast: free %u, block %u", (unsigned) fre, (unsigned) blk);
+                return false;
+              }
+              return wifi::global_wifi_component->is_connected();
+          else:
+            - script.stop: fetch_forecast
+      - http_request.get:
+          url: !lambda 'return std::string("https://api.forecast.solar/estimate/watthours/day/${latitude}/${longitude}/") + str_sprintf("%.0f/%.0f/%.1f", id(n_pv_tilt).state, id(n_pv_az).state, id(n_pv_kwp).state);'
+          capture_response: true
+          max_response_buffer_size: 1024
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    ESP_LOGW("fc", "forecast.solar HTTP %d", response->status_code);
+                    return;
+                  }
+                  auto t = id(sntp_time).now();
+                  if (!t.is_valid()) return;
+                  const std::string today = t.strftime("%Y-%m-%d");
+                  const std::string tmrw = ESPTime::from_epoch_local(t.timestamp + 86400).strftime("%Y-%m-%d");
+                  json::parse_json(body, [&](JsonObject root) -> bool {
+                    JsonVariant v = root["result"][today];
+                    if (v.isNull()) return false;
+                    id(fc_today_kwh) = v.as<float>() / 1000.0f;
+                    JsonVariant w = root["result"][tmrw];
+                    if (!w.isNull()) id(fc_tomorrow_kwh) = w.as<float>() / 1000.0f;
+                    id(fc_updated) = t.strftime("%H:%M");
+                    return true;
+                  });
+          on_error:
+            then:
+              - logger.log: { level: WARN, format: "forecast.solar unreachable" }
+      - delay: 2s
+      - if:
+          condition:
+            lambda: |-
+              size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+              size_t fre = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+              if (blk < 24000 || fre < 45000) {
+                ESP_LOGW("fc", "skip forecast: free %u, block %u", (unsigned) fre, (unsigned) blk);
+                return false;
+              }
+              return wifi::global_wifi_component->is_connected();
+          else:
+            - script.stop: fetch_forecast
+      - http_request.get:
+          url: !lambda 'return std::string("https://api.forecast.solar/estimate/watts/${latitude}/${longitude}/") + str_sprintf("%.0f/%.0f/%.1f", id(n_pv_tilt).state, id(n_pv_az).state, id(n_pv_kwp).state);'
+          capture_response: true
+          max_response_buffer_size: 3072
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) return;
+                  auto t = id(sntp_time).now();
+                  if (!t.is_valid()) return;
+                  const std::string today = t.strftime("%Y-%m-%d");
+                  json::parse_json(body, [&](JsonObject root) -> bool {
+                    std::vector<std::pair<int, float>> c;
+                    for (JsonPair kv : root["result"].as<JsonObject>()) {
+                      const char *k = kv.key().c_str();          // "YYYY-MM-DD HH:MM:SS"
+                      int hh, mm;
+                      if (strncmp(k, today.c_str(), 10) == 0 && sscanf(k + 11, "%d:%d", &hh, &mm) == 2)
+                        c.push_back({hh * 60 + mm, kv.value().as<float>()});
+                    }
+                    std::sort(c.begin(), c.end());
+                    if (!c.empty()) id(fc_curve) = c;
+                    return true;
+                  });
+
+  # Red banner on the screen (tap = silence + dismiss). Newest message replaces the old one.
+  - id: notify
+    mode: restart
+    parameters:
+      msg: string
+    then:
+      - lvgl.label.update:
+          id: lbl_alert
+          text: !lambda 'return msg;'
+      - lvgl.widget.show: lbl_alert
+      - script.execute: bl_wake
+      - delay: 5min
+      - lvgl.widget.hide: lbl_alert
+
+  # Backlight on at the wanted level (100 %, or the auto-brightness level).
+  - id: bl_wake
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda 'return id(bl_target).state;'
+          transition_length: 0s
+
+  # Short on-screen message, shown over any page (top layer).
+  - id: toast
+    mode: restart
+    parameters:
+      msg: string
+    then:
+      - lvgl.label.update:
+          id: lbl_toast
+          text: !lambda 'return msg;'
+      - lvgl.widget.show: lbl_toast
+      - delay: 3s
+      - lvgl.widget.hide: lbl_toast
+
+# -----------------------------------------------------------------------------
+# UI (320x240 landscape). Page 1 = status, page 2 = settings. Swipe or tap tabs.
+# -----------------------------------------------------------------------------
+lvgl:
+  displays: [tft]
+  touchscreens: [touch]
+  buffer_size: 25%               # no PSRAM on the CYD
+  # Layout generated by ui.py and checked against the real Montserrat glyph widths
+  # (no overlaps, nothing outside the screen or under the nav bar).
+  theme:
+    dark_mode: true
+    label:
+      text_color: 0x9AA8B5
+    buttonmatrix:
+      bg_opa: TRANSP
+      border_width: 0
+      pad_all: 2
+      pad_column: 4
+      text_font: montserrat_16
+      items:
+        bg_color: 0x26323F
+        text_color: 0xECEFF1
+        radius: 8
+        pressed:
+          bg_color: 0x1565C0
+    button:
+      radius: 10
+      shadow_width: 0
+      pressed:
+        bg_color: 0x1565C0
+    switch:
+      bg_color: 0x37474F
+      indicator:
+        checked:
+          bg_color: 0x43A047
+    arc:
+      arc_color: 0x26323F
+      knob:
+        bg_opa: TRANSP
+        pad_all: 0
+  style_definitions:
+    - id: chip                   # highlighted value
+      bg_color: 0x1C2833
+      bg_opa: COVER
+      border_color: 0x34506A
+      border_width: 1
+      radius: 6
+      pad_left: 7
+      pad_right: 7
+      pad_top: 3
+      pad_bottom: 3
+      text_color: 0xFFCA28
+  on_idle:
+    - timeout: 90s
+      then:
+        - light.turn_on: { id: backlight, brightness: 15% }
+    - timeout: 10min
+      then:
+        - light.turn_off: backlight
+  # Shown over every page: nav bar, alarm banner, short messages, touch-debug dot.
+  top_layer:
+    widgets:
+      - obj:
+          x: 0
+          y: 200
+          width: 320
+          height: 40
+          bg_color: 0x0A0F14
+          bg_opa: COVER
+          border_width: 0
+          radius: 0
+          pad_all: 0
+          scrollable: false
+      - buttonmatrix:
+          id: nav
+          x: 0
+          y: 200
+          width: 320
+          height: 40
+          text_font: montserrat_20
+          items:
+            bg_color: 0x1A2735
+            text_color: 0x90CAF9
+          rows:
+            - buttons:
+                - text: "\uF015"
+                  on_click:
+                  - lvgl.page.show: page_main
+                - text: "\uF0E7"
+                  on_click:
+                  - lvgl.page.show: page_i_power
+                - text: "\uF011"
+                  on_click:
+                  - lvgl.page.show: page_control
+                - text: "\uF013"
+                  on_click:
+                  - lvgl.page.show: page_s_res
+                - text: "\uF0C9"
+                  on_click:
+                  - lvgl.page.show: page_a_high1
+      - label:
+          id: lbl_alert
+          hidden: true
+          clickable: true
+          align: CENTER
+          y: -20
+          width: 280
+          long_mode: WRAP
+          text_align: CENTER
+          text_font: montserrat_18
+          bg_color: 0xC62828
+          bg_opa: COVER
+          text_color: 0xFFFFFF
+          radius: 10
+          pad_all: 12
+          text: ""
+          on_click:                    # tap = silence and dismiss
+            - rtttl.stop: { id: buzzer }
+            - lambda: 'id(tune_prio) = 0;'
+            - lvgl.widget.hide: lbl_alert
+      - label:
+          id: lbl_toast
+          hidden: true
+          align: BOTTOM_MID
+          y: -46
+          width: 300
+          long_mode: WRAP
+          text_align: CENTER
+          text_font: montserrat_16
+          bg_color: 0x37474F
+          bg_opa: COVER
+          text_color: 0xFFFFFF
+          pad_all: 8
+          radius: 8
+          text: ""
+      - obj:
+          id: touch_dot
+          hidden: true
+          clickable: false
+          width: 10
+          height: 10
+          radius: 5
+          bg_color: 0xFF1744
+          bg_opa: COVER
+          border_width: 0
+  pages:
+    - id: page_main
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - arc:
+            id: arc_soc
+            x: 2
+            y: 2
+            width: 140
+            height: 140
+            min_value: 0
+            max_value: 100
+            value: 0
+            adjustable: false
+            clickable: false
+            arc_width: 10
+            indicator:
+              arc_color: 0x43A047
+              arc_width: 10
+        - arc:
+            id: arc_pv
+            x: 16
+            y: 16
+            width: 112
+            height: 112
+            min_value: 0
+            max_value: 100
+            value: 0
+            adjustable: false
+            clickable: false
+            arc_width: 10
+            indicator:
+              arc_color: 0xFFB300
+              arc_width: 10
+        - arc:
+            id: arc_load
+            x: 30
+            y: 30
+            width: 84
+            height: 84
+            min_value: 0
+            max_value: 4000
+            value: 0
+            adjustable: false
+            clickable: false
+            arc_width: 10
+            indicator:
+              arc_color: 0x29B6F6
+              arc_width: 10
+        - label:
+            id: lbl_soc
+            x: 2
+            y: 61
+            width: 140
+            text_align: CENTER
+            text_font: montserrat_20
+            text_color: 0xFFFFFF
+            text: "N/A"
+        - label:
+            x: 150
+            y: 7
+            text_font: montserrat_18
+            text_color: 0x43A047
+            text: "Batt"
+        - label:
+            id: v_batt
+            x: 202
+            y: 4
+            width: 116
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_20
+            text: "N/A"
+        - label:
+            x: 150
+            y: 42
+            text_font: montserrat_18
+            text_color: 0xFFB300
+            text: "PV"
+        - label:
+            id: v_pv
+            x: 202
+            y: 39
+            width: 116
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_20
+            text: "N/A"
+        - label:
+            x: 150
+            y: 77
+            text_font: montserrat_18
+            text_color: 0x29B6F6
+            text: "Load"
+        - label:
+            id: v_load
+            x: 202
+            y: 74
+            width: 116
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_20
+            text: "N/A"
+        - label:
+            x: 150
+            y: 112
+            text_font: montserrat_18
+            text: "Grid"
+        - label:
+            id: v_grid
+            x: 202
+            y: 109
+            width: 116
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_20
+            text: "N/A"
+        - label:
+            id: lbl_mode
+            x: 6
+            y: 146
+            width: 308
+            long_mode: DOT
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "?"
+        - label:
+            id: lbl_status
+            x: 6
+            y: 175
+            text_font: montserrat_16
+            text: ""
+        - label:
+            id: ic_inv
+            x: 212
+            y: 175
+            text_font: montserrat_16
+            text_color: 0xE53935
+            text: "INV"
+        - label:
+            id: ic_ha
+            x: 250
+            y: 175
+            text_font: montserrat_16
+            text_color: 0xE53935
+            text: "HA"
+        - label:
+            id: ic_wifi
+            x: 292
+            y: 175
+            text_font: montserrat_16
+            text_color: 0xE53935
+            text: "\uF1EB"
+    - id: page_i_power
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "INFO 1/4"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Live power"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_i_sys
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_i_proj
+        - label:
+            x: 4
+            y: 46
+            text_font: montserrat_16
+            text: "PV"
+        - label:
+            id: p_pv
+            x: 52
+            y: 42
+            width: 108
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 168
+            y: 46
+            text_font: montserrat_16
+            text: "Batt"
+        - label:
+            id: p_bv
+            x: 220
+            y: 42
+            width: 98
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 4
+            y: 77
+            text_font: montserrat_16
+            text: "Load"
+        - label:
+            id: p_load
+            x: 52
+            y: 73
+            width: 108
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 168
+            y: 77
+            text_font: montserrat_16
+            text: "SOC"
+        - label:
+            id: p_soc
+            x: 220
+            y: 73
+            width: 98
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 4
+            y: 108
+            text_font: montserrat_16
+            text: "Batt"
+        - label:
+            id: p_batt
+            x: 52
+            y: 104
+            width: 108
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 168
+            y: 108
+            text_font: montserrat_16
+            text: "Grid"
+        - label:
+            id: p_gv
+            x: 220
+            y: 104
+            width: 98
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 4
+            y: 139
+            text_font: montserrat_16
+            text: "Grid"
+        - label:
+            id: p_grid
+            x: 52
+            y: 135
+            width: 108
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 168
+            y: 139
+            text_font: montserrat_16
+            text: "Temp"
+        - label:
+            id: p_temp
+            x: 220
+            y: 135
+            width: 98
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 4
+            y: 170
+            text_font: montserrat_16
+            text: "Solar"
+        - label:
+            id: p_solar
+            x: 52
+            y: 166
+            width: 108
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 168
+            y: 170
+            text_font: montserrat_16
+            text: "Data"
+        - label:
+            id: lbl_age
+            x: 220
+            y: 166
+            width: 98
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+    - id: page_i_proj
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "INFO 2/4"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Projections"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_i_power
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_i_energy
+        - label:
+            x: 6
+            y: 42
+            text_color: 0x43A047
+            text: "BATTERY"
+        - label:
+            x: 166
+            y: 42
+            text_color: 0xFFB300
+            text: "SOLAR FORECAST"
+        - label:
+            x: 6
+            y: 58
+            text: "Remaining"
+        - label:
+            id: x_left
+            x: 6
+            y: 74
+            width: 148
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            x: 6
+            y: 105
+            text: "Runtime at load now"
+        - label:
+            id: x_rt_now
+            x: 6
+            y: 121
+            width: 148
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            x: 6
+            y: 152
+            text: "Runtime at 1h avg"
+        - label:
+            id: x_rt_1h
+            x: 6
+            y: 168
+            width: 148
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            x: 166
+            y: 58
+            text: "Now"
+        - label:
+            id: x_fc_now
+            x: 166
+            y: 74
+            width: 152
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            x: 166
+            y: 105
+            text: "Today"
+        - label:
+            id: x_fc_today
+            x: 166
+            y: 121
+            width: 152
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            x: 166
+            y: 152
+            text: "Tomorrow"
+        - label:
+            id: x_fc_tmrw
+            x: 166
+            y: 168
+            width: 152
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - label:
+            id: lbl_fc_upd
+            x: 240
+            y: 58
+            width: 78
+            long_mode: DOT
+            text_align: RIGHT
+            text: ""
+    - id: page_i_energy
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "INFO 3/4"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Energy today"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_i_proj
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_i_sys
+        - label:
+            x: 6
+            y: 46
+            text_font: montserrat_18
+            text_color: 0xFFB300
+            text: "Solar"
+        - label:
+            id: e_solar
+            x: 178
+            y: 42
+            width: 140
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 6
+            y: 77
+            text_font: montserrat_18
+            text_color: 0x29B6F6
+            text: "Load"
+        - label:
+            id: e_load
+            x: 178
+            y: 73
+            width: 140
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 6
+            y: 108
+            text_font: montserrat_18
+            text: "Grid import"
+        - label:
+            id: e_grid
+            x: 178
+            y: 104
+            width: 140
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 6
+            y: 139
+            text_font: montserrat_18
+            text_color: 0x43A047
+            text: "Batt charged"
+        - label:
+            id: e_chg
+            x: 178
+            y: 135
+            width: 140
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+        - label:
+            x: 6
+            y: 170
+            text_font: montserrat_18
+            text_color: 0x43A047
+            text: "Batt discharged"
+        - label:
+            id: e_dis
+            x: 178
+            y: 166
+            width: 140
+            text_align: RIGHT
+            styles: chip
+            text_font: montserrat_18
+            text: "N/A"
+    - id: page_i_sys
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "INFO 4/4"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "System"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_i_energy
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_i_power
+        - label:
+            x: 6
+            y: 45
+            text: "Firmware"
+        - label:
+            id: i_fw
+            x: 78
+            y: 42
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 67
+            text: "Built"
+        - label:
+            id: i_built
+            x: 78
+            y: 64
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 89
+            text: "WiFi"
+        - label:
+            id: i_wifi
+            x: 78
+            y: 86
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 111
+            text: "IP"
+        - label:
+            id: i_ip
+            x: 78
+            y: 108
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 133
+            text: "Signal"
+        - label:
+            id: i_rssi
+            x: 78
+            y: 130
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 155
+            text: "Uptime"
+        - label:
+            id: i_up
+            x: 78
+            y: 152
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 177
+            text: "Memory"
+        - label:
+            id: i_mem
+            x: 78
+            y: 174
+            width: 240
+            long_mode: DOT
+            styles: chip
+            text: "--"
+    - id: page_control
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 13
+            text_font: montserrat_18
+            text_color: 0xECEFF1
+            text: "Auto"
+        - switch:
+            id: lv_auto_ctl
+            x: 98
+            y: 9
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: auto_ctl ]
+                  else: [ switch.turn_off: auto_ctl ]
+        - label:
+            x: 166
+            y: 13
+            text_font: montserrat_18
+            text_color: 0xECEFF1
+            text: "Observe"
+        - switch:
+            id: lv_sw_observe
+            x: 258
+            y: 9
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_observe ]
+                  else: [ switch.turn_off: sw_observe ]
+        - button:
+            x: 4
+            y: 50
+            width: 154
+            height: 50
+            bg_color: 0x2E7D32
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+                  text: "Battery (SBU)"
+            on_click:
+              - if:
+                  condition: { binary_sensor.is_on: inv_link }
+                  then:
+                    - switch.turn_off: auto_ctl
+                    - select.set: { id: sel_output_source_priority, option: "Battery first (SBU)" }
+                  else:
+                    - script.execute: { id: toast, msg: "No inverter link - not sent" }
+        - button:
+            x: 162
+            y: 50
+            width: 154
+            height: 50
+            bg_color: 0xE65100
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+                  text: "Grid (SUB)"
+            on_click:
+              - if:
+                  condition: { binary_sensor.is_on: inv_link }
+                  then:
+                    - switch.turn_off: auto_ctl
+                    - select.set: { id: sel_output_source_priority, option: "Solar first (SUB)" }
+                  else:
+                    - script.execute: { id: toast, msg: "No inverter link - not sent" }
+        - label:
+            x: 6
+            y: 112
+            text: "Mode"
+        - label:
+            id: lbl_ctl_state
+            x: 68
+            y: 106
+            width: 250
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 144
+            text: "Charger"
+        - label:
+            id: lbl_chg_state
+            x: 68
+            y: 138
+            width: 250
+            styles: chip
+            text: "--"
+        - label:
+            x: 6
+            y: 174
+            width: 312
+            long_mode: DOT
+            text: "Battery / Grid buttons turn Auto off."
+    - id: page_s_res
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "SETUP 1/5"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Battery reserve"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_s_disp
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_s_plan
+        - label:
+            x: 6
+            y: 43
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Sunny: grid below"
+        - label:
+            id: lb_n_sunny_sw
+            x: 156
+            y: 48
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_sunny_sw, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_sunny_sw, cycle: false }
+        - label:
+            x: 6
+            y: 82
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Sunny: battery above"
+        - label:
+            id: lb_n_sunny_ret
+            x: 156
+            y: 87
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 83
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_sunny_ret, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_sunny_ret, cycle: false }
+        - label:
+            x: 6
+            y: 121
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Cloudy: grid below"
+        - label:
+            id: lb_n_cloudy_sw
+            x: 156
+            y: 126
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 122
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_cloudy_sw, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_cloudy_sw, cycle: false }
+        - label:
+            x: 6
+            y: 160
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Cloudy: battery above"
+        - label:
+            id: lb_n_cloudy_ret
+            x: 156
+            y: 165
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 161
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_cloudy_ret, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_cloudy_ret, cycle: false }
+    - id: page_s_plan
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "SETUP 2/5"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Forecast & charging"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_s_res
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_s_rules
+        - label:
+            x: 6
+            y: 60
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Cloudy if forecast below"
+        - label:
+            id: lb_n_cloudy_kwh
+            x: 156
+            y: 70
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 56
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_cloudy_kwh, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_cloudy_kwh, cycle: false }
+        - label:
+            x: 6
+            y: 138
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Cloudy: grid-charge to"
+        - label:
+            id: lb_n_chg_target
+            x: 156
+            y: 148
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 134
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_chg_target, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_chg_target, cycle: false }
+    - id: page_s_rules
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "SETUP 3/5"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Rules"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_s_plan
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_s_sound
+        - label:
+            x: 6
+            y: 60
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Low batt"
+        - switch:
+            id: lv_sw_rule_low
+            x: 98
+            y: 54
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_low ]
+                  else: [ switch.turn_off: sw_rule_low ]
+        - label:
+            x: 166
+            y: 60
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "High load"
+        - switch:
+            id: lv_sw_rule_high
+            x: 258
+            y: 54
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_high ]
+                  else: [ switch.turn_off: sw_rule_high ]
+        - label:
+            x: 6
+            y: 112
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Night load"
+        - switch:
+            id: lv_sw_rule_night
+            x: 98
+            y: 106
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_night ]
+                  else: [ switch.turn_off: sw_rule_night ]
+        - label:
+            x: 166
+            y: 112
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Overnight"
+        - switch:
+            id: lv_sw_rule_ovn
+            x: 258
+            y: 106
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_ovn ]
+                  else: [ switch.turn_off: sw_rule_ovn ]
+        - label:
+            x: 6
+            y: 164
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Charger"
+        - switch:
+            id: lv_sw_rule_charge
+            x: 98
+            y: 158
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_charge ]
+                  else: [ switch.turn_off: sw_rule_charge ]
+        - label:
+            x: 166
+            y: 164
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Float V"
+        - switch:
+            id: lv_sw_rule_float
+            x: 258
+            y: 158
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_rule_float ]
+                  else: [ switch.turn_off: sw_rule_float ]
+    - id: page_s_sound
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "SETUP 4/5"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Sound"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_s_rules
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_s_disp
+        - label:
+            x: 6
+            y: 52
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Buzzer"
+        - switch:
+            id: lv_sw_buzzer
+            x: 98
+            y: 46
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_buzzer ]
+                  else: [ switch.turn_off: sw_buzzer ]
+        - label:
+            x: 166
+            y: 52
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Quiet hrs"
+        - switch:
+            id: lv_sw_quiet
+            x: 258
+            y: 46
+            width: 56
+            height: 30
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_quiet ]
+                  else: [ switch.turn_off: sw_quiet ]
+        - label:
+            x: 6
+            y: 90
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Quiet from"
+        - label:
+            id: lb_n_quiet_start
+            x: 156
+            y: 86
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 84
+            width: 72
+            height: 33
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_quiet_start, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_quiet_start, cycle: false }
+        - label:
+            x: 6
+            y: 127
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Quiet until"
+        - label:
+            id: lb_n_quiet_end
+            x: 156
+            y: 123
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 121
+            width: 72
+            height: 33
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_quiet_end, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_quiet_end, cycle: false }
+        - buttonmatrix:
+            x: 4
+            y: 158
+            width: 312
+            height: 40
+            rows:
+              - buttons:
+                  - text: "\uF028 Test tune"
+                    on_click:
+                    - script.execute: { id: play_tune, tune: "test", prio: 1, critical: true }
+                  - text: "\uF026 Silence"
+                    on_click:
+                    - rtttl.stop: { id: buzzer }
+                    - lambda: 'id(tune_prio) = 0;'
+    - id: page_s_disp
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "SETUP 5/5"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Display"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_s_sound
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_s_res
+        - label:
+            x: 6
+            y: 49
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Auto bright"
+        - switch:
+            id: lv_sw_autobl
+            x: 120
+            y: 45
+            width: 56
+            height: 26
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_autobl ]
+                  else: [ switch.turn_off: sw_autobl ]
+        - label:
+            x: 186
+            y: 49
+            text: "Light"
+        - label:
+            id: lbl_ldr
+            x: 226
+            y: 44
+            width: 92
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 4
+            y: 76
+            width: 312
+            height: 34
+            rows:
+              - buttons:
+                  - text: "Dark = now"
+                    on_click:
+                    - number.set: { id: n_ldr_dark, value: !lambda 'return id(s_ldr).state;' }
+                  - text: "Bright = now"
+                    on_click:
+                    - number.set: { id: n_ldr_bright, value: !lambda 'return id(s_ldr).state;' }
+        - label:
+            id: lbl_ldr_cal
+            x: 6
+            y: 113
+            width: 312
+            text_align: CENTER
+            text: ""
+        - label:
+            x: 6
+            y: 132
+            width: 146
+            long_mode: WRAP
+            text: "Auto min brightness"
+        - label:
+            id: lb_n_bl_min
+            x: 156
+            y: 136
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 132
+            width: 72
+            height: 32
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_bl_min, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_bl_min, cycle: false }
+        - label:
+            x: 6
+            y: 173
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Touch dot"
+        - switch:
+            id: lv_sw_touchdbg
+            x: 120
+            y: 169
+            width: 56
+            height: 26
+            on_change:
+              - if:
+                  condition:
+                    lambda: 'return x;'
+                  then: [ switch.turn_on: sw_touchdbg ]
+                  else: [ switch.turn_off: sw_touchdbg ]
+    - id: page_a_high1
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 1/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "High load"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_reset
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_high2
+        - label:
+            x: 6
+            y: 43
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Grid when load above"
+        - label:
+            id: lb_n_high_on_w
+            x: 156
+            y: 49
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_on_w, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_on_w, cycle: false }
+        - label:
+            x: 6
+            y: 91
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "...for at least"
+        - label:
+            id: lb_n_high_on_s
+            x: 156
+            y: 88
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 83
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_on_s, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_on_s, cycle: false }
+        - label:
+            x: 6
+            y: 121
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "Release when load below"
+        - label:
+            id: lb_n_high_off_w
+            x: 156
+            y: 127
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 122
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_off_w, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_off_w, cycle: false }
+        - label:
+            x: 6
+            y: 169
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_16
+            text: "...for at least"
+        - label:
+            id: lb_n_high_off_s
+            x: 156
+            y: 166
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 161
+            width: 72
+            height: 35
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_off_s, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_off_s, cycle: false }
+    - id: page_a_high2
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 2/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "High load limits"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_high1
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_night1
+        - label:
+            x: 6
+            y: 60
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Only if SOC below"
+        - label:
+            id: lb_n_high_max_soc
+            x: 156
+            y: 69
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 56
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_max_soc, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_max_soc, cycle: false }
+        - label:
+            x: 6
+            y: 138
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Only if PV below"
+        - label:
+            id: lb_n_high_max_pv
+            x: 156
+            y: 147
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_16
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 134
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_high_max_pv, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_high_max_pv, cycle: false }
+    - id: page_a_night1
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 3/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Night load on"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_high2
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_night2
+        - label:
+            x: 6
+            y: 47
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Grid when load above"
+        - label:
+            id: lb_n_night_on_w
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_night_on_w, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_night_on_w, cycle: false }
+        - label:
+            x: 6
+            y: 109
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...for at least"
+        - label:
+            id: lb_n_night_on_s
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_night_on_s, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_night_on_s, cycle: false }
+        - label:
+            x: 6
+            y: 151
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Only if SOC below"
+        - label:
+            id: lb_n_night_max_soc
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_night_max_soc, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_night_max_soc, cycle: false }
+    - id: page_a_night2
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 4/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Night load off"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_night1
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_night3
+        - label:
+            x: 6
+            y: 60
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Release when load below"
+        - label:
+            id: lb_n_night_off_w
+            x: 156
+            y: 67
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 56
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_night_off_w, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_night_off_w, cycle: false }
+        - label:
+            x: 6
+            y: 148
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...for at least"
+        - label:
+            id: lb_n_night_off_s
+            x: 156
+            y: 145
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 134
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_night_off_s, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_night_off_s, cycle: false }
+    - id: page_a_night3
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 5/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Night release 2"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_night2
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_ovn1
+        - label:
+            x: 6
+            y: 47
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Or battery above"
+        - label:
+            id: lb_n_back_soc
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_back_soc, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_back_soc, cycle: false }
+        - label:
+            x: 6
+            y: 99
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...and load below"
+        - label:
+            id: lb_n_back_w
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_back_w, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_back_w, cycle: false }
+        - label:
+            x: 6
+            y: 161
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...for at least"
+        - label:
+            id: lb_n_back_s
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_back_s, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_back_s, cycle: false }
+    - id: page_a_ovn1
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 6/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Overnight"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_night3
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_ovn2
+        - label:
+            x: 6
+            y: 47
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Min SOC at sunrise"
+        - label:
+            id: lb_n_ovn_floor
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_ovn_floor, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_ovn_floor, cycle: false }
+        - label:
+            x: 6
+            y: 109
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Release margin"
+        - label:
+            id: lb_n_ovn_margin
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_ovn_margin, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_ovn_margin, cycle: false }
+        - label:
+            x: 6
+            y: 151
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Base load at least"
+        - label:
+            id: lb_n_base_floor
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_18
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_base_floor, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_base_floor, cycle: false }
+    - id: page_a_ovn2
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 7/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Overnight sun delay"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_ovn1
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_chg1
+        - label:
+            x: 6
+            y: 60
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Sun useful after (sunny)"
+        - label:
+            id: lb_n_sun_delay_sunny
+            x: 156
+            y: 67
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 56
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_sun_delay_sunny, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_sun_delay_sunny, cycle: false }
+        - label:
+            x: 6
+            y: 148
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...after (cloudy)"
+        - label:
+            id: lb_n_sun_delay_cloudy
+            x: 156
+            y: 145
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 134
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_sun_delay_cloudy, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_sun_delay_cloudy, cycle: false }
+    - id: page_a_chg1
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 8/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Grid charging"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_ovn2
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_chg2
+        - label:
+            x: 6
+            y: 47
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Emergency charge below"
+        - label:
+            id: lb_n_emerg_soc
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_emerg_soc, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_emerg_soc, cycle: false }
+        - label:
+            x: 6
+            y: 109
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "...charge up to"
+        - label:
+            id: lb_n_emerg_target
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_emerg_target, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_emerg_target, cycle: false }
+        - label:
+            x: 6
+            y: 151
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Fast charge below"
+        - label:
+            id: lb_n_fast_below
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_fast_below, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_fast_below, cycle: false }
+    - id: page_a_chg2
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 9/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Charge current"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_chg1
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_timing
+        - label:
+            x: 6
+            y: 57
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Fast current"
+        - label:
+            id: lb_n_chg_fast_a
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_chg_fast_a, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_chg_fast_a, cycle: false }
+        - label:
+            x: 6
+            y: 109
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Normal current"
+        - label:
+            id: lb_n_chg_norm_a
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_chg_norm_a, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_chg_norm_a, cycle: false }
+        - label:
+            x: 6
+            y: 151
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Restart below target by"
+        - label:
+            id: lb_n_chg_margin
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_chg_margin, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_chg_margin, cycle: false }
+    - id: page_a_timing
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 10/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Timing"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_chg2
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_batt
+        - label:
+            x: 6
+            y: 47
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "SOC must hold for"
+        - label:
+            id: lb_n_low_delay
+            x: 156
+            y: 54
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_low_delay, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_low_delay, cycle: false }
+        - label:
+            x: 6
+            y: 99
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Min time on grid"
+        - label:
+            id: lb_n_min_sub
+            x: 156
+            y: 106
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_min_sub, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_min_sub, cycle: false }
+        - label:
+            x: 6
+            y: 161
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Float voltage"
+        - label:
+            id: lb_n_float_v
+            x: 156
+            y: 158
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text_font: montserrat_20
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_float_v, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_float_v, cycle: false }
+    - id: page_a_batt
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 11/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Battery capacity"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_timing
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_pv
+        - label:
+            x: 6
+            y: 60
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Battery capacity"
+        - label:
+            id: lb_n_batt_kwh
+            x: 156
+            y: 70
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 56
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_batt_kwh, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_batt_kwh, cycle: false }
+        - label:
+            x: 6
+            y: 138
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Treat as empty at"
+        - label:
+            id: lb_n_empty_soc
+            x: 156
+            y: 148
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 134
+            width: 72
+            height: 50
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_empty_soc, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_empty_soc, cycle: false }
+    - id: page_a_pv
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 12/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Solar panels"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_batt
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_reset
+        - label:
+            x: 6
+            y: 57
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Array size"
+        - label:
+            id: lb_n_pv_kwp
+            x: 156
+            y: 57
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 44
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_pv_kwp, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_pv_kwp, cycle: false }
+        - label:
+            x: 6
+            y: 109
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Tilt (0 = flat)"
+        - label:
+            id: lb_n_pv_tilt
+            x: 156
+            y: 109
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 96
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_pv_tilt, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_pv_tilt, cycle: false }
+        - label:
+            x: 6
+            y: 151
+            width: 146
+            long_mode: WRAP
+            text_font: montserrat_18
+            text: "Facing (0=S -90=E 90=W)"
+        - label:
+            id: lb_n_pv_az
+            x: 156
+            y: 161
+            width: 86
+            text_align: CENTER
+            styles: chip
+            text: "--"
+        - buttonmatrix:
+            x: 246
+            y: 148
+            width: 72
+            height: 48
+            rows:
+              - buttons:
+                  - text: "\uF068"
+                    on_click:
+                    - number.decrement: { id: n_pv_az, cycle: false }
+                  - text: "\uF067"
+                    on_click:
+                    - number.increment: { id: n_pv_az, cycle: false }
+    - id: page_a_reset
+      scrollable: false
+      bg_color: 0x10161D
+      bg_opa: COVER
+      widgets:
+        - label:
+            x: 6
+            y: 3
+            text: "ADVANCED 13/13"
+        - label:
+            x: 6
+            y: 19
+            text_font: montserrat_18
+            text_color: 0x4FC3F7
+            text: "Restore defaults"
+        - buttonmatrix:
+            x: 240
+            y: 2
+            width: 78
+            height: 36
+            rows:
+              - buttons:
+                  - text: "\uF053"
+                    on_click:
+                    - lvgl.page.show: page_a_pv
+                  - text: "\uF054"
+                    on_click:
+                    - lvgl.page.show: page_a_high1
+        - label:
+            x: 6
+            y: 46
+            width: 308
+            long_mode: WRAP
+            text_font: montserrat_16
+            text_color: 0xECEFF1
+            text: "Sets every rule, threshold, sound and display setting back to its default."
+        - label:
+            x: 6
+            y: 86
+            width: 308
+            long_mode: WRAP
+            text: "Keeps the touch and light-sensor calibration."
+        - button:
+            x: 40
+            y: 122
+            width: 240
+            height: 48
+            bg_color: 0xE53935
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+                  text: "Restore defaults"
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(reset_armed) != 0 && millis() - id(reset_armed) < 5000;'
+                  then:
+                    - lambda: 'id(reset_armed) = 0;'
+                    - script.execute: restore_defaults
+                    - script.execute: { id: toast, msg: "Defaults restored" }
+                  else:
+                    - lambda: 'id(reset_armed) = millis();'
+                    - script.execute: { id: toast, msg: "Tap again within 5 s to restore defaults" }
+        - label:
+            x: 6
+            y: 176
+            width: 308
+            text_align: CENTER
+            text: "Tap twice within 5 s to confirm."
+
+# -----------------------------------------------------------------------------
+# SENSORS (same as inverter-esphome.yaml + ids used by the control logic)
+# -----------------------------------------------------------------------------
+sensor:
+  # Heap watch (no PSRAM): shows whether the HTTPS fetch has room.
+  - platform: debug
+    free:
+      name: "Heap Free"
+      internal: true
+      entity_category: diagnostic
+    block:
+      name: "Heap Max Block"
+      entity_category: diagnostic
+
+  - platform: pipsolar
+    pipsolar_id: my_inverter
+    battery_bulk_voltage:
+      name: "Battery Bulk Voltage"
+      internal: true
+      filters: [throttle: 10s]
+    battery_float_voltage:
+      id: s_battery_float_voltage
+      name: "Battery Float Voltage"
+      internal: true
+      filters: [throttle: 10s]
+    battery_recharge_voltage:
+      id: s_battery_recharge_voltage
+      name: "Battery Recharge Voltage"
+      internal: true
+      filters: [throttle: 10s]
+    battery_redischarge_voltage:
+      id: s_battery_redischarge_voltage
+      name: "Battery Re-discharge Voltage"
+      internal: true
+      filters: [throttle: 10s]
+    battery_under_voltage:
+      id: s_battery_under_voltage
+      name: "Battery Under Voltage"
+      internal: true
+      filters: [throttle: 10s]
+    battery_type:
+      name: "Battery Type (raw)"
+      internal: true
+      filters: [throttle: 60s]
+    current_max_ac_charging_current:
+      id: s_max_ac_charging_current
+      name: "Max AC Charging Current"
+      internal: true
+      filters: [throttle: 3s]
+    current_max_charging_current:
+      name: "Max Charging Current"
+      internal: true
+      filters: [throttle: 3s]
+    output_source_priority:
+      id: s_output_source_priority
+      name: "Output Source Priority (raw)"
+      internal: true
+      filters: [throttle: 2s]
+    charger_source_priority:
+      id: s_charger_source_priority
+      name: "Charger Source Priority (raw)"
+      internal: true
+      filters: [throttle: 2s]
+
+    grid_voltage:
+      id: s_grid_v
+      name: "Grid Voltage"
+      filters: [throttle_average: 3s]
+    ac_output_voltage:
+      name: "AC Output Voltage"
+      internal: true
+      filters: [throttle_average: 3s]
+    ac_output_apparent_power:
+      name: "AC Output Apparent Power"
+      internal: true
+    ac_output_active_power:
+      id: s_load_power
+      name: "AC Output Active Power"
+      filters: [delta: 2]
+    output_load_percent:
+      name: "Output Load Percent"
+      internal: true
+    bus_voltage:
+      name: "Bus Voltage"
+      internal: true
+      filters: [throttle_average: 3s]
+    battery_voltage:
+      id: s_batt_v
+      name: "Battery Voltage"
+      filters:
+        - throttle_average: 2s
+        - delta: 0.5
+      on_raw_value:   # every inverter reply, before filters (NaN = no/garbled reply)
+        - lambda: 'if (!isnan(x)) id(last_inverter_data) = millis();'
+    battery_charging_current:
+      id: s_batt_chg_a
+      name: "Battery Charging Current"
+      internal: true
+      filters: [throttle_average: 1s]
+    battery_discharge_current:
+      id: s_batt_dis_a
+      name: "Battery Discharge Current"
+      internal: true
+      filters: [throttle_average: 1s]
+    battery_capacity_percent:
+      id: s_soc
+      name: "Battery Capacity Percent"
+      filters: [throttle_average: 5s]
+    inverter_heat_sink_temperature:
+      id: s_heatsink
+      name: "Inverter Heat Sink Temperature"
+      filters: [throttle_average: 5s]
+    pv_input_voltage:
+      name: "PV Input Voltage"
+      internal: true
+      filters: [throttle_average: 3s]
+    pv_input_current_for_battery:
+      name: "PV Input Current For Battery"
+      internal: true
+      filters: [throttle_average: 10s]
+    pv_charging_power:
+      id: s_pv_power
+      name: "PV Charging Power"
+      filters:
+        - throttle_average: 5s
+        - delta: 1
+
+  - platform: template
+    id: batt_charge_power
+    name: "Battery Charge Power"
+    internal: true
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (isnan(id(s_batt_v).state) || isnan(id(s_batt_chg_a).state)) return {};
+      return id(s_batt_v).state * id(s_batt_chg_a).state;
+  - platform: template
+    id: batt_discharge_power
+    name: "Battery Discharge Power"
+    internal: true
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (isnan(id(s_batt_v).state) || isnan(id(s_batt_dis_a).state)) return {};
+      return id(s_batt_v).state * id(s_batt_dis_a).state;
+  - platform: template
+    id: batt_power
+    name: "Battery Power"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (isnan(id(batt_discharge_power).state) || isnan(id(batt_charge_power).state)) return {};
+      return id(batt_discharge_power).state - id(batt_charge_power).state;
+  - platform: template
+    id: grid_power
+    name: "Grid Power (estimated)"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (isnan(id(s_grid_v).state) || id(s_grid_v).state < 100) return 0.0f;
+      float load = isnan(id(s_load_power).state) ? 0 : id(s_load_power).state;
+      float pv   = isnan(id(s_pv_power).state)   ? 0 : id(s_pv_power).state;
+      float chg  = isnan(id(batt_charge_power).state)    ? 0 : id(batt_charge_power).state;
+      float dis  = isnan(id(batt_discharge_power).state) ? 0 : id(batt_discharge_power).state;
+      float g = load + chg - pv - dis;
+      return g > 110 ? g : 0.0f;
+
+  - platform: integration
+    name: "Solar Energy"
+    sensor: s_pv_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters: [multiply: 0.001]
+  - platform: integration
+    name: "Battery Charge Energy"
+    sensor: batt_charge_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters: [multiply: 0.001]
+  - platform: integration
+    name: "Battery Discharge Energy"
+    sensor: batt_discharge_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters: [multiply: 0.001]
+  - platform: integration
+    name: "Grid Import Energy"
+    sensor: grid_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters: [multiply: 0.001]
+  - platform: integration
+    name: "Load Energy"
+    sensor: s_load_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters: [multiply: 0.001]
+  # ---- controller plan (exposed to Home Assistant)
+  - platform: template
+    name: "Reserve Switch SOC"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return id(reserve_sw);'
+  - platform: template
+    name: "Reserve Return SOC"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return id(reserve_ret);'
+  - platform: template
+    name: "Solar Forecast Used"
+    unit_of_measurement: kWh
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: 'return id(plan_fc);'
+  - platform: template
+    name: "Solar Forecast Today"
+    unit_of_measurement: kWh
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: 'return id(fc_today_kwh);'
+  - platform: template
+    name: "Solar Forecast Tomorrow"
+    unit_of_measurement: kWh
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: 'return id(fc_tomorrow_kwh);'
+  - platform: template
+    name: "Predicted SOC At Sun"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return id(soc_at_sun);'
+  - platform: template
+    name: "Base Load"
+    unit_of_measurement: W
+    device_class: power
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return id(base_load);'
+  - platform: template
+    name: "Battery Remaining"
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      const float soc = id(s_soc).state;
+      if (!id(inv_link).state || isnan(soc)) return {};
+      return std::max(0.0f, id(n_batt_kwh).state * (soc - id(n_empty_soc).state) / 100.0f);
+  - platform: template
+    name: "Battery Runtime"
+    unit_of_measurement: h
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      const float soc = id(s_soc).state;
+      if (!id(inv_link).state || isnan(soc)) return {};
+      return std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state)) / id(base_load);
+  - platform: total_daily_energy
+    id: e_load_today
+    name: "Load Energy Today"
+    internal: true
+    power_id: s_load_power
+    time_id: sntp_time
+    restore: true
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    filters: [multiply: 0.001]
+  - platform: total_daily_energy
+    id: e_grid_today
+    name: "Grid Import Energy Today"
+    internal: true
+    power_id: grid_power
+    time_id: sntp_time
+    restore: true
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    filters: [multiply: 0.001]
+  - platform: total_daily_energy
+    id: e_chg_today
+    name: "Battery Charge Energy Today"
+    internal: true
+    power_id: batt_charge_power
+    time_id: sntp_time
+    restore: true
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    filters: [multiply: 0.001]
+  - platform: total_daily_energy
+    id: e_dis_today
+    name: "Battery Discharge Energy Today"
+    internal: true
+    power_id: batt_discharge_power
+    time_id: sntp_time
+    restore: true
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    filters: [multiply: 0.001]
+  # rolling 1 h average of the load (sample every 15 s, 240 samples), for the runtime estimate
+  - platform: template
+    id: s_load_1h
+    name: "Load 1h Average"
+    internal: true
+    unit_of_measurement: W
+    device_class: power
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: |-
+      if (!id(inv_link).state || isnan(id(s_load_power).state)) return {};
+      return id(s_load_power).state;
+    filters:
+      - sliding_window_moving_average: { window_size: 240, send_every: 4, send_first_at: 1 }
+  - platform: total_daily_energy
+    id: e_solar_today
+    name: "Solar Energy Today"
+    internal: true
+    power_id: s_pv_power
+    time_id: sntp_time
+    restore: true
+    unit_of_measurement: kWh
+    accuracy_decimals: 2
+    filters: [multiply: 0.001]
+
+  # On-board light sensor (LDR on GPIO34, ADC1). Raw volts: higher = darker.
+  # Only measured for now; auto-dim the backlight once real readings are known.
+  - platform: adc
+    id: s_ldr
+    name: "Ambient Light (raw)"
+    internal: true
+    pin: GPIO34
+    attenuation: 0db
+    update_interval: 1s
+    entity_category: diagnostic
+    accuracy_decimals: 3
+    filters:
+      - median: { window_size: 5, send_every: 2 }
+
+  # Backlight level wanted right now (0-1). Auto off -> 100 %.
+  # Linear between the two calibration readings, so it works whichever way the LDR goes.
+  - platform: template
+    id: bl_target
+    internal: true
+    update_interval: 2s
+    lambda: |-
+      if (!id(sw_autobl).state) return 1.0f;
+      float v = id(s_ldr).state, d = id(n_ldr_dark).state, b = id(n_ldr_bright).state;
+      if (isnan(v) || fabsf(d - b) < 0.005f) return 1.0f;
+      float dark = clamp((v - b) / (d - b), 0.0f, 1.0f);    // 0 = bright room, 1 = dark room
+      float lo = id(n_bl_min).state / 100.0f;
+      return 1.0f - dark * (1.0f - lo);
+
+  - platform: wifi_signal
+    id: s_rssi
+    name: "ESP WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "ESP Uptime"
+    update_interval: 60s
+  - platform: template
+    name: "Inverter Data Age"
+    internal: true
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: 'return (millis() - id(last_inverter_data)) / 1000.0;'
+
+
+binary_sensor:
+  - platform: template
+    name: "Cloudy Day Plan"
+    lambda: 'return id(cloudy);'
+  - platform: template
+    name: "Grid Charging Active"
+    lambda: 'return id(charging);'
+  - platform: template
+    name: "Controller Fault"
+    device_class: problem
+    lambda: 'return id(ctl_fault);'
+  # BOOT button (GPIO0, only a strapping pin at reset): each press = next touch orientation
+  - platform: gpio
+    id: btn_boot
+    internal: true
+    pin: { number: GPIO0, inverted: true, mode: { input: true, pullup: true }, ignore_strapping_warning: true }
+    filters: [delayed_on: 30ms]
+    on_press:
+      - lambda: |-
+          uint8_t o = (id(touch_orient) + 1) & 7;
+          id(touch_orient) = o;
+          id(touch).set_swap_xy(o & 4);
+          id(touch).set_mirror_x(o & 2);
+          id(touch).set_mirror_y(o & 1);
+          ESP_LOGW("touch", "orientation %u: swap=%d mx=%d my=%d", o, !!(o & 4), !!(o & 2), !!(o & 1));
+      - script.execute:
+          id: toast
+          msg: !lambda |-
+            uint8_t o = id(touch_orient);
+            return str_sprintf("Touch %u/8: swap %s, mirror X %s, Y %s", o + 1,
+                               (o & 4) ? "on" : "off", (o & 2) ? "on" : "off", (o & 1) ? "on" : "off");
+      - script.execute: bl_wake
+
+  # Fresh inverter data (< 30 s). Pipsolar sensors keep their last value when the
+  # link drops, so the screen and the inverter controls go by this, not by NaN.
+  - platform: template
+    id: inv_link
+    name: "Inverter Link"
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: |-
+      return id(last_inverter_data) != 0 && millis() - id(last_inverter_data) < 30000 &&
+             !isnan(id(s_soc).state) && !isnan(id(s_load_power).state);
+
+  - platform: pipsolar
+    pipsolar_id: my_inverter
+    load_status:
+      name: "Load On"
+      internal: true
+    charging_status:
+      name: "Charging"
+      internal: true
+    scc_charging_status:
+      name: "Solar Charging"
+      internal: true
+    ac_charging_status:
+      name: "AC Charging"
+      internal: true
+    charging_to_floating_mode:
+      id: bs_floating
+      name: "Floating Mode"
+      internal: true
+      # "Adjust Float mode": entering float -> configured float voltage
+      on_press:
+        - if:
+            condition:
+              lambda: |-
+                return id(sw_rule_float).state &&
+                       fabsf(id(s_battery_float_voltage).state - id(n_float_v).state) > 0.05f;
+            then:
+              - select.set:
+                  id: sel_battery_float_voltage
+                  option: !lambda 'return str_sprintf("%.1f", id(n_float_v).state);'
+    warnings_present:
+      name: "Warnings Present"
+    faults_present:
+      name: "Faults Present"
+    warning_line_fail:
+      name: "Warning Grid Lost"
+      internal: true
+    warning_battery_low_alarm:
+      name: "Warning Battery Low"
+      internal: true
+    warning_battery_under_shutdown:
+      name: "Warning Battery Under Shutdown"
+      internal: true
+    warning_over_load:
+      name: "Warning Overload"
+      internal: true
+    warning_over_temperature:
+      name: "Warning Over Temperature"
+      internal: true
+    warning_fan_lock:
+      name: "Warning Fan Lock"
+      internal: true
+  - platform: template
+    id: bs_grid
+    name: "Grid Available"
+    device_class: power
+    lambda: 'return !isnan(id(s_grid_v).state) && id(s_grid_v).state > 150;'
+    filters:
+      - delayed_on: 30s
+      - delayed_off: 30s
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0 && millis() - id(boot_ms) > 90000;'
+          then:
+            - script.execute: { id: play_tune, tune: "grid_back", prio: 1, critical: false }
+    on_release:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0 && millis() - id(boot_ms) > 90000;'
+          then:
+            - lambda: |-
+                // @sim:grid_lost
+                const float soc = id(s_soc).state;
+                const bool low = !isnan(soc) && soc < ${alarm_soc};
+                id(low_alarmed) = low;
+                id(play_tune).execute(std::string(low ? "alarm_no_grid" : "grid_lost"), low ? 3 : 2, low);
+  - platform: status
+    name: "ESP Status"
+
+text_sensor:
+  - platform: template
+    name: "Controller State"
+    update_interval: 10s
+    lambda: |-
+      if (!id(inv_link).state) return std::string("no inverter data");
+      const uint8_t r = id(sub_reasons);
+      std::string why;
+      if (r & 1) why += " LOW";
+      if (r & 2) why += " HIGH";
+      if (r & 4) why += " NIGHT";
+      if (r & 8) why += " OVERNIGHT";
+      if (r & 16) why += " CHARGE";
+      std::string s = std::string(id(want_sub) ? "grid (SUB)" : "battery (SBU)") + why;
+      if (!id(auto_ctl).state) s = "manual";
+      else if (id(sw_observe).state) s = "observe only: would " + s;
+      if (id(ctl_fault)) s += ", FAULT";
+      return s;
+  - platform: pipsolar
+    pipsolar_id: my_inverter
+    device_mode:
+      name: "Device Mode"
+      filters:
+        - map:
+            - P -> Power On
+            - S -> Standby
+            - L -> Line (Grid)
+            - B -> Battery
+            - F -> Fault
+            - H -> Power Saving
+            - D -> Shutdown
+    last_qpiws:
+      name: "Warning Bits (QPIWS)"
+  - platform: version
+    name: "ESPHome Version"
+  - platform: wifi_info
+    ssid:
+      id: t_ssid
+      name: "ESP WiFi SSID"
+    ip_address:
+      id: t_ip
+      name: "ESP IP Address"
+
+button:
+  - platform: template
+    name: "LED Test"
+    icon: mdi:led-on
+    entity_category: config
+    on_press:
+      - script.execute: led_selftest
+  - platform: template
+    name: "Buzzer Test"
+    entity_category: config
+    on_press:
+      - script.execute: { id: play_tune, tune: "test", prio: 1, critical: true }
+  - platform: restart
+    name: "ESP Restart"
+  - platform: safe_mode
+    name: "ESP Safe Mode Boot"
+
+# -----------------------------------------------------------------------------
+# SELECTS (unchanged from inverter-esphome.yaml)
+# -----------------------------------------------------------------------------
+select:
+  - platform: template
+    name: "Output Source Priority"
+    id: sel_output_source_priority
+    update_interval: 3s
+    options:
+      - "Utility first (USB)"
+      - "Solar first (SUB)"
+      - "Battery first (SBU)"
+    lambda: |-
+      float v = id(s_output_source_priority).state;
+      if (isnan(v)) return {};
+      switch ((int) v) {
+        case 0: return std::string("Utility first (USB)");
+        case 1: return std::string("Solar first (SUB)");
+        case 2: return std::string("Battery first (SBU)");
+      }
+      return {};
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_output_source_priority
+          value: !lambda |-
+            if (x == "Utility first (USB)") return 0.0f;
+            if (x == "Solar first (SUB)") return 1.0f;
+            return 2.0f;
+
+  - platform: template
+    name: "Charger Source Priority"
+    internal: true
+    id: sel_charger_source_priority
+    update_interval: 3s
+    options:
+      - "Utility first"
+      - "Solar first"
+      - "Solar and utility"
+      - "Solar only"
+    lambda: |-
+      float v = id(s_charger_source_priority).state;
+      if (isnan(v)) return {};
+      switch ((int) v) {
+        case 0: return std::string("Utility first");
+        case 1: return std::string("Solar first");
+        case 2: return std::string("Solar and utility");
+        case 3: return std::string("Solar only");
+      }
+      return {};
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_charger_source_priority
+          value: !lambda |-
+            if (x == "Utility first") return 0.0f;
+            if (x == "Solar first") return 1.0f;
+            if (x == "Solar and utility") return 2.0f;
+            return 3.0f;
+
+  - platform: template
+    name: "Set Max AC Charging Current"
+    internal: true
+    id: sel_max_ac_charging_current
+    update_interval: 3s
+    options: ["2", "10", "20", "30", "40", "50", "60"]
+    lambda: |-
+      float v = id(s_max_ac_charging_current).state;
+      if (isnan(v)) return {};
+      char buf[8]; snprintf(buf, sizeof(buf), "%.0f", v);
+      return std::string(buf);
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_max_ac_charging_current
+          value: !lambda return atof(x.c_str());
+
+  - platform: template
+    name: "Set Battery Recharge Voltage"
+    internal: true
+    id: sel_battery_recharge_voltage
+    update_interval: 3s
+    options: ["22.0", "22.5", "23.0", "23.5", "24.0", "24.5", "25.0", "25.5"]
+    lambda: |-
+      float v = id(s_battery_recharge_voltage).state;
+      if (isnan(v)) return {};
+      char buf[8]; snprintf(buf, sizeof(buf), "%.1f", v);
+      return std::string(buf);
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_battery_recharge_voltage
+          value: !lambda return atof(x.c_str());
+
+  - platform: template
+    name: "Set Battery Re-discharge Voltage"
+    internal: true
+    id: sel_battery_redischarge_voltage
+    update_interval: 3s
+    options: ["24.0", "24.5", "25.0", "25.5", "26.0", "26.5", "27.0", "27.5", "28.0", "28.5", "29.0"]
+    lambda: |-
+      float v = id(s_battery_redischarge_voltage).state;
+      if (isnan(v)) return {};
+      char buf[8]; snprintf(buf, sizeof(buf), "%.1f", v);
+      return std::string(buf);
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_battery_redischarge_voltage
+          value: !lambda return atof(x.c_str());
+
+  - platform: template
+    name: "Set Battery Under Voltage"
+    internal: true
+    id: sel_battery_under_voltage
+    update_interval: 3s
+    options: ["21.0", "21.1", "21.2", "21.3", "21.4", "21.5", "21.6", "21.7", "21.8", "21.9", "22.0", "22.1", "22.2", "22.3", "22.4", "22.5", "22.6", "22.7", "22.8", "22.9", "23.0", "23.1", "23.2", "23.3", "23.4", "23.5", "23.6", "23.7", "23.8", "23.9", "24.0"]
+    lambda: |-
+      float v = id(s_battery_under_voltage).state;
+      if (isnan(v)) return {};
+      char buf[8]; snprintf(buf, sizeof(buf), "%.1f", v);
+      return std::string(buf);
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_battery_under_voltage
+          value: !lambda return atof(x.c_str());
+
+  - platform: template
+    name: "Set Battery Float Voltage"
+    internal: true
+    id: sel_battery_float_voltage
+    update_interval: 3s
+    options: ["24.0", "24.1", "24.2", "24.3", "24.4", "24.5", "24.6", "24.7", "24.8", "24.9", "25.0", "25.1", "25.2", "25.3", "25.4", "25.5", "25.6", "25.7", "25.8", "25.9", "26.0", "26.1", "26.2", "26.3", "26.4", "26.5", "26.6", "26.7", "26.8", "26.9", "27.0", "27.1", "27.2", "27.3", "27.4", "27.5", "27.6", "27.7", "27.8", "27.9", "28.0", "28.1", "28.2", "28.3", "28.4", "28.5", "28.6", "28.7", "28.8", "28.9", "29.0", "29.1", "29.2"]
+    lambda: |-
+      float v = id(s_battery_float_voltage).state;
+      if (isnan(v)) return {};
+      char buf[8]; snprintf(buf, sizeof(buf), "%.1f", v);
+      return std::string(buf);
+    set_action:
+      - output.pipsolar.set_level:
+          id: out_battery_float_voltage
+          value: !lambda return atof(x.c_str());

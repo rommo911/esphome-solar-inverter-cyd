@@ -1,0 +1,15 @@
+services:
+  esphome:
+    container_name: esphome
+    image: ghcr.io/esphome/esphome:latest
+    restart: unless-stopped
+    ports:
+      - "6052:6052"
+    volumes:
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=UTC # Replace with your timezone (e.g., America/New_York, Europe/London)
+    # Uncomment if passing a USB serial device directly into Docker (requires usbipd in WSL)
+#    devices:
+#       - /dev/ttyUSB0:/dev/ttyUSB0
