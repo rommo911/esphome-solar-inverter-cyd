@@ -5817,7 +5817,6 @@ select:
 
   - platform: template
     name: "Charger Source Priority"
-    internal: true
     id: sel_charger_source_priority
     update_interval: 3s
     options:
@@ -5846,7 +5845,6 @@ select:
 
   - platform: template
     name: "Set Max AC Charging Current"
-    internal: true
     id: sel_max_ac_charging_current
     update_interval: 3s
     options: ["2", "10", "20", "30", "40", "50", "60"]
