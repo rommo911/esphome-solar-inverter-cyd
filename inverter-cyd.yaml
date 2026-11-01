@@ -372,6 +372,18 @@ globals:
   - id: fc_last_try             # millis() of the last fetch attempt, 0 = never
     type: uint32_t
     initial_value: '0'
+  - id: fc_ok                   # last attempt succeeded (false -> retry after fc_wait)
+    type: bool
+    initial_value: 'false'
+  - id: fc_wait                 # ms until the next attempt after a failure (1 min, 15 min after HTTP 429)
+    type: uint32_t
+    initial_value: '60000'
+  - id: fc_status               # short, for the screen: "updated 14:05", "HTTP 429", "low memory"...
+    type: std::string
+    initial_value: '"not fetched"'
+  - id: fc_detail               # full reason, for the log and Home Assistant
+    type: std::string
+    initial_value: '"not fetched yet"'
   # Touch orientation, bit 2 = swap_xy, bit 1 = mirror_x, bit 0 = mirror_y.
   # BOOT button cycles it (saved), so it can be fixed without reflashing.
   - id: touch_orient
@@ -1698,18 +1710,29 @@ interval:
             id(play_tune).execute(std::string("warn_morning"), 3, true);
           }
 
-  # Forecast refresh: every 2 h, or every 15 min until the first good fetch.
+  # Forecast refresh: every 2 h after a good fetch; after a failure every 1 min
+  # (15 min after HTTP 429: the free API allows ~12 requests/hour and each fetch makes 2).
   - interval: 60s
     then:
       - if:
           condition:
             lambda: |-
               if (millis() < 60000 || id(fetch_forecast).is_running()) return false;
-              if (!wifi::global_wifi_component->is_connected() || !id(sntp_time).now().is_valid()) return false;
-              uint32_t wait = id(fc_updated).empty() ? 15UL * 60000UL : 2UL * 3600000UL;
+              if (!wifi::global_wifi_component->is_connected()) {
+                id(fc_status) = "no WiFi"; id(fc_detail) = "waiting for WiFi";
+                return false;
+              }
+              if (!id(sntp_time).now().is_valid()) {
+                id(fc_status) = "no clock"; id(fc_detail) = "waiting for the clock (SNTP)";
+                return false;
+              }
+              const uint32_t wait = id(fc_ok) ? 2UL * 3600000UL : id(fc_wait);
               return id(fc_last_try) == 0 || millis() - id(fc_last_try) >= wait;
           then:
-            - lambda: 'id(fc_last_try) = millis();'
+            - lambda: |-
+                id(fc_last_try) = millis();
+                id(fc_ok) = false;          // set back to true only by a good day-totals reply
+                id(fc_wait) = 60000;
             - script.execute: fetch_forecast
 
   # Status LED: green ok, blue = no WiFi, red blink = no inverter data, amber = on grid
@@ -2069,7 +2092,7 @@ script:
       - lvgl.label.update:
           id: lbl_fc_upd
           text: !lambda |-
-            return id(fc_updated).empty() ? std::string("not fetched") : "updated " + id(fc_updated);
+            return id(fc_status);
       - lvgl.label.update:
           id: i_fw
           text: !lambda |-
@@ -2198,12 +2221,26 @@ script:
               size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
               size_t fre = heap_caps_get_free_size(MALLOC_CAP_8BIT);
               if (blk < 24000 || fre < 45000) {
-                ESP_LOGW("fc", "skip forecast: free %u, block %u", (unsigned) fre, (unsigned) blk);
+                id(fc_status) = "low memory";
+                id(fc_detail) = str_sprintf("skipped: not enough memory for HTTPS (free %u B, largest block %u B; need 45000 / 24000)",
+                                            (unsigned) fre, (unsigned) blk);
+                ESP_LOGW("fc", "%s", id(fc_detail).c_str());
                 return false;
               }
-              return wifi::global_wifi_component->is_connected();
+              if (!wifi::global_wifi_component->is_connected()) {
+                id(fc_status) = "no WiFi"; id(fc_detail) = "skipped: WiFi not connected";
+                ESP_LOGW("fc", "%s", id(fc_detail).c_str());
+                return false;
+              }
+              return true;
           else:
             - script.stop: fetch_forecast
+      - lambda: |-
+          id(fc_status) = "fetching";
+          ESP_LOGW("fc", "GET https://api.forecast.solar/estimate/watthours/day/${latitude}/${longitude}/%.0f/%.0f/%.1f (free %u B, block %u B)",
+                   id(n_pv_tilt).state, id(n_pv_az).state, id(n_pv_kwp).state,
+                   (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                   (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
       - http_request.get:
           url: !lambda 'return std::string("https://api.forecast.solar/estimate/watthours/day/${latitude}/${longitude}/") + str_sprintf("%.0f/%.0f/%.1f", id(n_pv_tilt).state, id(n_pv_az).state, id(n_pv_kwp).state);'
           capture_response: true
@@ -2212,25 +2249,52 @@ script:
             then:
               - lambda: |-
                   if (response->status_code != 200) {
-                    ESP_LOGW("fc", "forecast.solar HTTP %d", response->status_code);
+                    id(fc_status) = str_sprintf("HTTP %d", response->status_code);
+                    id(fc_detail) = str_sprintf("day totals: HTTP %d: %.150s", response->status_code, body.c_str());
+                    if (response->status_code == 429) id(fc_wait) = 15UL * 60000UL;    // rate limited: back off
+                    ESP_LOGW("fc", "%s", id(fc_detail).c_str());
                     return;
                   }
                   auto t = id(sntp_time).now();
-                  if (!t.is_valid()) return;
+                  if (!t.is_valid()) { id(fc_status) = "no clock"; id(fc_detail) = "reply ignored: clock not set"; return; }
                   const std::string today = t.strftime("%Y-%m-%d");
                   const std::string tmrw = ESPTime::from_epoch_local(t.timestamp + 86400).strftime("%Y-%m-%d");
-                  json::parse_json(body, [&](JsonObject root) -> bool {
+                  bool found = false;
+                  const bool parsed = json::parse_json(body, [&](JsonObject root) -> bool {
                     JsonVariant v = root["result"][today];
                     if (v.isNull()) return false;
+                    found = true;
                     id(fc_today_kwh) = v.as<float>() / 1000.0f;
                     JsonVariant w = root["result"][tmrw];
                     if (!w.isNull()) id(fc_tomorrow_kwh) = w.as<float>() / 1000.0f;
-                    id(fc_updated) = t.strftime("%H:%M");
                     return true;
                   });
+                  if (!found) {
+                    id(fc_status) = "bad data";
+                    id(fc_detail) = str_sprintf("day totals: %s, no value for %s: %.150s",
+                                                parsed ? "JSON ok" : "JSON not readable", today.c_str(), body.c_str());
+                    ESP_LOGW("fc", "%s", id(fc_detail).c_str());
+                    return;
+                  }
+                  id(fc_ok) = true;
+                  id(fc_updated) = t.strftime("%H:%M");
+                  id(fc_status) = "updated " + id(fc_updated);
+                  id(fc_detail) = str_sprintf("ok %s: today %.1f kWh, tomorrow %.1f kWh", id(fc_updated).c_str(),
+                                              id(fc_today_kwh), id(fc_tomorrow_kwh));
+                  ESP_LOGW("fc", "%s", id(fc_detail).c_str());
           on_error:
             then:
-              - logger.log: { level: WARN, format: "forecast.solar unreachable" }
+              - lambda: |-
+                  id(fc_status) = "no connect";
+                  id(fc_detail) = str_sprintf("day totals: connection / TLS failed (see the http_request error above; free %u B, block %u B)",
+                                              (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                                              (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                  ESP_LOGW("fc", "%s", id(fc_detail).c_str());
+      - if:
+          condition:
+            lambda: 'return id(fc_ok);'          # power curve only after good day totals
+          else:
+            - script.stop: fetch_forecast
       - delay: 2s
       - if:
           condition:
@@ -2238,10 +2302,18 @@ script:
               size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
               size_t fre = heap_caps_get_free_size(MALLOC_CAP_8BIT);
               if (blk < 24000 || fre < 45000) {
-                ESP_LOGW("fc", "skip forecast: free %u, block %u", (unsigned) fre, (unsigned) blk);
+                id(fc_status) = "low memory";
+                id(fc_detail) = str_sprintf("skipped: not enough memory for HTTPS (free %u B, largest block %u B; need 45000 / 24000)",
+                                            (unsigned) fre, (unsigned) blk);
+                ESP_LOGW("fc", "%s", id(fc_detail).c_str());
                 return false;
               }
-              return wifi::global_wifi_component->is_connected();
+              if (!wifi::global_wifi_component->is_connected()) {
+                id(fc_status) = "no WiFi"; id(fc_detail) = "skipped: WiFi not connected";
+                ESP_LOGW("fc", "%s", id(fc_detail).c_str());
+                return false;
+              }
+              return true;
           else:
             - script.stop: fetch_forecast
       - http_request.get:
@@ -2251,7 +2323,10 @@ script:
           on_response:
             then:
               - lambda: |-
-                  if (response->status_code != 200) return;
+                  if (response->status_code != 200) {
+                    ESP_LOGW("fc", "power curve: HTTP %d: %.150s", response->status_code, body.c_str());
+                    return;
+                  }
                   auto t = id(sntp_time).now();
                   if (!t.is_valid()) return;
                   const std::string today = t.strftime("%Y-%m-%d");
@@ -2265,8 +2340,12 @@ script:
                     }
                     std::sort(c.begin(), c.end());
                     if (!c.empty()) id(fc_curve) = c;
+                    ESP_LOGW("fc", "power curve: %u points for today", (unsigned) c.size());
                     return true;
                   });
+          on_error:
+            then:
+              - logger.log: { level: WARN, tag: fc, format: "power curve: connection / TLS failed" }
 
   # Red banner on the screen (tap = silence + dismiss). Newest message replaces the old one.
   - id: notify
@@ -5727,6 +5806,12 @@ binary_sensor:
     name: "ESP Status"
 
 text_sensor:
+  - platform: template
+    name: "Forecast Status"
+    icon: mdi:weather-partly-cloudy
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return id(fc_detail);'
   - platform: template
     name: "Controller State"
     update_interval: 10s

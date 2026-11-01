@@ -263,7 +263,7 @@ PROJ = {
                  'return str_sprintf("%.0f W", v);'),
     "x_fc_today": _FC.format(g="fc_today_kwh"),
     "x_fc_tmrw": _FC.format(g="fc_tomorrow_kwh"),
-    "lbl_fc_upd": 'return id(fc_updated).empty() ? std::string("not fetched") : "updated " + id(fc_updated);',
+    "lbl_fc_upd": 'return id(fc_status);',
 }
 # Info page rows: (name, id, sample, C++ returning std::string)
 INFO = [
