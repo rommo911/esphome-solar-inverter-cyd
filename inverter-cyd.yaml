@@ -75,9 +75,11 @@ preferences:
 logger:
   level: WARN
 
-# Standalone: never reboot because HA or WiFi is missing (defaults are 15 min).
-api:
-  reboot_timeout: 0s
+# Home Assistant API: off by default (standalone). To connect HA, uncomment both lines.
+# Note: the ESPHome dashboard's "Logs" over WiFi also needs the API; without it, read logs over
+# USB at web.esphome.io. reboot_timeout 0s = never reboot because HA is missing.
+# api:
+#   reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -89,20 +91,23 @@ wifi:
   power_save_mode: NONE
   min_auth_mode: WPA2
   reboot_timeout: 0s
-  manual_ip:
-    static_ip: 192.168.10.4      # .3 is the current inverter board; switch to .3 at cut-over
-    gateway: 192.168.10.1
-    subnet: 255.255.255.0
-    dns1: 8.8.8.8
-    dns2: 8.8.4.4
+  # DHCP: works on any network. The fixed address below is for the house network (192.168.10.x)
+  # only - on another network it joins WiFi but cannot reach the internet (no time, no forecast).
+  # manual_ip:
+  #   static_ip: 192.168.10.4
+  #   gateway: 192.168.10.1
+  #   subnet: 255.255.255.0
+  #   dns1: 8.8.8.8
+  #   dns2: 8.8.4.4
 
 time:
   - platform: sntp
     id: sntp_time
     timezone: ${timezone}
-    servers:
+    servers:                     # three independent providers (ESPHome takes up to 3)
       - 0.pool.ntp.org
-      - 1.pool.ntp.org
+      - time.google.com
+      - time.cloudflare.com
     on_time:
       # Persistence forecast (no internet): remember today's measured solar before it resets.
       - seconds: 30
@@ -118,8 +123,9 @@ time:
               id(fc_today_kwh) = id(fc_tomorrow_kwh);    // refreshed by the next fetch
               id(fc_tomorrow_kwh) = NAN;
               id(fc_curve).clear();
-  - platform: homeassistant      # extra source when HA happens to be up
-    id: ha_time
+  # Extra time source when HA is connected - needs the api: block above.
+  # - platform: homeassistant
+  #   id: ha_time
 
 sun:
   id: sun_c
@@ -1780,7 +1786,12 @@ interval:
           text_color: !lambda 'return lv_color_hex(id(inv_link).state ? 0x43A047 : 0xE53935);'
       - lvgl.label.update:
           id: ic_ha
-          text_color: !lambda 'return lv_color_hex(api::global_api_server->is_connected() ? 0x43A047 : 0xE53935);'
+          text_color: !lambda |-
+            #ifdef USE_API
+            return lv_color_hex(api::global_api_server->is_connected() ? 0x43A047 : 0xE53935);
+            #else
+            return lv_color_hex(0x4A5560);   // API not compiled in: grey
+            #endif
       - lvgl.label.update:
           id: ic_wifi
           text_color: !lambda 'return lv_color_hex(wifi::global_wifi_component->is_connected() ? 0x43A047 : 0xE53935);'
