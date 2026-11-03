@@ -108,6 +108,9 @@ time:
       - 0.pool.ntp.org
       - time.google.com
       - time.cloudflare.com
+    update_interval: 5min        # each sync also proves the internet works (WiFi icon)
+    on_time_sync:
+      - lambda: 'id(net_ok_ms) = std::max<uint32_t>(millis(), 1);'
     on_time:
       # Persistence forecast (no internet): remember today's measured solar before it resets.
       - seconds: 30
@@ -375,6 +378,9 @@ globals:
     type: std::vector<std::pair<int, float>>
   - id: fc_updated              # "HH:MM" of the last good fetch, empty = never
     type: std::string
+  - id: net_ok_ms               # millis() of the last internet contact (NTP sync, forecast reply); 0 = none
+    type: uint32_t
+    initial_value: '0'
   - id: fc_last_try             # millis() of the last fetch attempt, 0 = never
     type: uint32_t
     initial_value: '0'
@@ -1794,7 +1800,11 @@ interval:
             #endif
       - lvgl.label.update:
           id: ic_wifi
-          text_color: !lambda 'return lv_color_hex(wifi::global_wifi_component->is_connected() ? 0x43A047 : 0xE53935);'
+          # red = no WiFi, yellow = WiFi but no internet contact for 11 min, green = internet OK
+          text_color: !lambda |-
+            if (!wifi::global_wifi_component->is_connected()) return lv_color_hex(0xE53935);
+            const bool inet = id(net_ok_ms) != 0 && millis() - id(net_ok_ms) < 11UL * 60000UL;
+            return lv_color_hex(inet ? 0x43A047 : 0xFDD835);
       - lvgl.label.update:
           id: lbl_mode
           text: !lambda |-
@@ -2259,6 +2269,7 @@ script:
           on_response:
             then:
               - lambda: |-
+                  id(net_ok_ms) = std::max<uint32_t>(millis(), 1);     // got a reply: internet works
                   if (response->status_code != 200) {
                     id(fc_status) = str_sprintf("HTTP %d", response->status_code);
                     id(fc_detail) = str_sprintf("day totals: HTTP %d: %.150s", response->status_code, body.c_str());
