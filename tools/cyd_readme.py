@@ -12,7 +12,7 @@ from cyd_settings import NUMBERS, SWITCHES  # noqa: E402
 
 # (group title, first id of the group) in the order of cyd_settings.NUMBERS
 GROUPS = [
-    ("Reserve planner", "n_cloudy_kwh"),
+    ("Reserve planner and forecast", "n_cloudy_kwh"),
     ("Charger manager", "n_chg_target"),
     ("Overnight rule", "n_ovn_floor"),
     ("Timing and float voltage", "n_low_delay"),

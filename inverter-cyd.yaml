@@ -689,6 +689,24 @@ number:
           then:
             - script.execute: { id: set_ui, what: 1, slot: 0, dir: 0 }
   - platform: template
+    id: n_fc_interval_h
+    name: "Forecast Refresh"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: 2
+    max_value: 8
+    step: 1
+    initial_value: 2
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - script.execute: { id: set_ui, what: 1, slot: 0, dir: 0 }
+  - platform: template
     id: n_sunny_sw
     name: "Sunny Day Switch SOC"
     entity_category: config
@@ -1750,7 +1768,7 @@ interval:
             id(play_tune).execute(std::string("warn_morning"), 3, true);
           }
 
-  # Forecast refresh: every 2 h after a good fetch; after a failure every 1 min
+  # Forecast refresh: every "Forecast Refresh" hours (2-8) after a good fetch; after a failure every 1 min
   # (15 min after HTTP 429: the free API allows ~12 requests/hour and each fetch makes 2).
   - interval: 60s
     then:
@@ -1766,7 +1784,7 @@ interval:
                 id(fc_status) = "no clock"; id(fc_detail) = "waiting for the clock (SNTP)";
                 return false;
               }
-              const uint32_t wait = id(fc_ok) ? 2UL * 3600000UL : id(fc_wait);
+              const uint32_t wait = id(fc_ok) ? (uint32_t) (id(n_fc_interval_h).state * 3600000.0f) : id(fc_wait);
               return id(fc_last_try) == 0 || millis() - id(fc_last_try) >= wait;
           then:
             - lambda: |-
@@ -1925,6 +1943,7 @@ script:
   - id: restore_defaults
     then:
       - number.set: { id: n_cloudy_kwh, value: 5 }
+      - number.set: { id: n_fc_interval_h, value: 2 }
       - number.set: { id: n_sunny_sw, value: 18 }
       - number.set: { id: n_sunny_ret, value: 25 }
       - number.set: { id: n_cloudy_sw, value: 25 }
@@ -2186,7 +2205,7 @@ script:
           struct Pg { const char *grp, *title; uint8_t nrows; Row r[4]; };
           static const Pg P[] = {
             {"SETUP 1/5", "Battery reserve", 4, {{id(n_sunny_sw), "Sunny: grid below", "%.0f %%", 43, 48, 44, 35, &lv_font_montserrat_16, &lv_font_montserrat_18}, {id(n_sunny_ret), "Sunny: battery above", "%.0f %%", 82, 87, 83, 35, &lv_font_montserrat_16, &lv_font_montserrat_18}, {id(n_cloudy_sw), "Cloudy: grid below", "%.0f %%", 121, 126, 122, 35, &lv_font_montserrat_16, &lv_font_montserrat_18}, {id(n_cloudy_ret), "Cloudy: battery above", "%.0f %%", 160, 165, 161, 35, &lv_font_montserrat_16, &lv_font_montserrat_18}}},
-            {"SETUP 2/5", "Forecast & charging", 2, {{id(n_cloudy_kwh), "Cloudy if forecast below", "%.1f kWh", 60, 70, 56, 50, &lv_font_montserrat_18, &lv_font_montserrat_14}, {id(n_chg_target), "Cloudy: grid-charge to", "%.0f %%", 138, 148, 134, 50, &lv_font_montserrat_18, &lv_font_montserrat_14}}},
+            {"SETUP 2/5", "Forecast & charging", 3, {{id(n_cloudy_kwh), "Cloudy if forecast below", "%.1f kWh", 47, 57, 44, 48, &lv_font_montserrat_18, &lv_font_montserrat_14}, {id(n_fc_interval_h), "Refresh forecast every", "%.0f h", 99, 109, 96, 48, &lv_font_montserrat_18, &lv_font_montserrat_14}, {id(n_chg_target), "Cloudy: grid-charge to", "%.0f %%", 151, 161, 148, 48, &lv_font_montserrat_18, &lv_font_montserrat_14}}},
             {"ADVANCED 1/13", "High load", 4, {{id(n_high_on_w), "Grid when load above", "%.0f W", 43, 49, 44, 35, &lv_font_montserrat_16, &lv_font_montserrat_16}, {id(n_high_on_s), "...for at least", "%.0f s", 91, 88, 83, 35, &lv_font_montserrat_16, &lv_font_montserrat_16}, {id(n_high_off_w), "Release when load below", "%.0f W", 121, 127, 122, 35, &lv_font_montserrat_16, &lv_font_montserrat_16}, {id(n_high_off_s), "...for at least", "%.0f s", 169, 166, 161, 35, &lv_font_montserrat_16, &lv_font_montserrat_16}}},
             {"ADVANCED 2/13", "High load limits", 2, {{id(n_high_max_soc), "Only if SOC below", "%.0f %%", 60, 69, 56, 50, &lv_font_montserrat_18, &lv_font_montserrat_16}, {id(n_high_max_pv), "Only if PV below", "%.0f W", 138, 147, 134, 50, &lv_font_montserrat_18, &lv_font_montserrat_16}}},
             {"ADVANCED 3/13", "Night load on", 3, {{id(n_night_on_w), "Grid when load above", "%.0f W", 47, 54, 44, 48, &lv_font_montserrat_18, &lv_font_montserrat_18}, {id(n_night_on_s), "...for at least", "%.0f s", 109, 106, 96, 48, &lv_font_montserrat_18, &lv_font_montserrat_18}, {id(n_night_max_soc), "Only if SOC below", "%.0f %%", 151, 158, 148, 48, &lv_font_montserrat_18, &lv_font_montserrat_18}}},

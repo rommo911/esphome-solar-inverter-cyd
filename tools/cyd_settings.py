@@ -9,6 +9,7 @@ cyd_ui.py (screen rows). All settings are exposed to Home Assistant (entity_cate
 NUMBERS = [
     # --- reserve planner (handoff 4A)
     ("n_cloudy_kwh", "Cloudy Below", "kWh", 0, 20, 0.5, 5, "Cloudy if forecast below", "%.1f kWh", ""),
+    ("n_fc_interval_h", "Forecast Refresh", "h", 2, 8, 1, 2, "Refresh forecast every", "%.0f h", ""),
     ("n_sunny_sw", "Sunny Day Switch SOC", "%", 16, 37, 1, 18, "Sunny: grid below", "%.0f %%", ""),
     ("n_sunny_ret", "Sunny Day Return SOC", "%", 25, 40, 1, 25, "Sunny: battery above", "%.0f %%", ""),
     ("n_cloudy_sw", "Cloudy Day Switch SOC", "%", 16, 37, 1, 25, "Cloudy: grid below", "%.0f %%", ""),
@@ -89,7 +90,7 @@ BY_ID = {n[0]: n for n in NUMBERS}
 # (page id, group, title, setting ids) - order = order on screen within the group.
 VPAGES = [
     ("page_s_res", "SETUP", "Battery reserve", ["n_sunny_sw", "n_sunny_ret", "n_cloudy_sw", "n_cloudy_ret"]),
-    ("page_s_plan", "SETUP", "Forecast & charging", ["n_cloudy_kwh", "n_chg_target"]),
+    ("page_s_plan", "SETUP", "Forecast & charging", ["n_cloudy_kwh", "n_fc_interval_h", "n_chg_target"]),
     ("page_a_high1", "ADVANCED", "High load", ["n_high_on_w", "n_high_on_s", "n_high_off_w", "n_high_off_s"]),
     ("page_a_high2", "ADVANCED", "High load limits", ["n_high_max_soc", "n_high_max_pv"]),
     ("page_a_night1", "ADVANCED", "Night load on", ["n_night_on_w", "n_night_on_s", "n_night_max_soc"]),

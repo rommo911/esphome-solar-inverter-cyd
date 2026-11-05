@@ -120,7 +120,7 @@ if it differs. Switch: Rule Float Voltage.
 ### Solar forecast
 Forecast.Solar (free API, HTTPS) for this location and the **PV Array Size / Tilt / Azimuth**
 settings (default 2 kWp, 40°, south): today's and tomorrow's kWh plus today's power curve
-("solar now"). Fetched about a minute after boot, then every 2 h; after a failure every 1 min
+("solar now"). Fetched about a minute after boot, then every **Forecast Refresh** hours (2 to 8, default 2); after a failure every 1 min
 (15 min after HTTP 429, the free rate limit). Every failure is logged under the tag `fc` and shown
 on Info → Projections and in the **Forecast Status** sensor. The fetch is skipped when free memory
 is below 45 KB (largest block 24 KB).
@@ -186,11 +186,12 @@ All settings are on the screen or in Home Assistant (entity category *config*), 
 This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
 
 <!-- settings:begin -->
-**Reserve planner**
+**Reserve planner and forecast**
 
 | Setting (HA name) | Default | Range | Step | On screen | Kept by Restore defaults |
 |---|---|---|---|---|---|
 | Cloudy Below | 5 kWh | 0 to 20 | 0.5 | yes | no |
+| Forecast Refresh | 2 h | 2 to 8 | 1 | yes | no |
 | Sunny Day Switch SOC | 18 % | 16 to 37 | 1 | yes | no |
 | Sunny Day Return SOC | 25 % | 25 to 40 | 1 | yes | no |
 | Cloudy Day Switch SOC | 25 % | 16 to 37 | 1 | yes | no |
