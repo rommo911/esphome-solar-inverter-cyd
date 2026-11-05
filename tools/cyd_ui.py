@@ -288,7 +288,7 @@ INFO = [
     ("IP", "i_ip", "192.168.100.100", 'return id(t_ip).has_state() ? id(t_ip).state : std::string("--");'),
     ("Signal", "i_rssi", "-100 dBm", None),
     ("Uptime", "i_up", "99d 23h 59m",
-     'uint32_t s = millis() / 1000;\nreturn str_sprintf("%ud %02uh %02um", s / 86400, (s / 3600) % 24, (s / 60) % 60);'),
+     'const unsigned s = millis() / 1000;\nreturn str_sprintf("%ud %02uh %02um", s / 86400, (s / 3600) % 24, (s / 60) % 60);'),
     ("Memory", "i_mem", "free 123 KB, block 99 KB",
      'return str_sprintf("free %u KB, block %u KB", (unsigned) (heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),\n'
      '                   (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024));'),

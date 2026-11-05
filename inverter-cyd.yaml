@@ -2161,7 +2161,7 @@ script:
       - lvgl.label.update:
           id: i_up
           text: !lambda |-
-            uint32_t s = millis() / 1000;
+            const unsigned s = millis() / 1000;
             return str_sprintf("%ud %02uh %02um", s / 86400, (s / 3600) % 24, (s / 60) % 60);
       - lvgl.label.update:
           id: i_mem
@@ -2447,8 +2447,11 @@ script:
                   const std::string today = t.strftime("%Y-%m-%d");
                   json::parse_json(body, [&](JsonObject root) -> bool {
                     std::vector<std::pair<int, float>> c;
-                    for (JsonPair kv : root["result"].as<JsonObject>()) {
-                      const char *k = kv.key().c_str();          // "YYYY-MM-DD HH:MM:SS"
+                    JsonObject result = root["result"];
+                    if (result.isNull()) return false;
+                    for (JsonPair kv : result) {
+                      const JsonString key = kv.key();
+                      const char *k = key.c_str();                // "YYYY-MM-DD HH:MM:SS"
                       int hh, mm;
                       if (strncmp(k, today.c_str(), 10) == 0 && sscanf(k + 11, "%d:%d", &hh, &mm) == 2)
                         c.push_back({hh * 60 + mm, kv.value().as<float>()});
