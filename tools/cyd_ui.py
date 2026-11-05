@@ -136,7 +136,7 @@ def sw_cell(x, y, cw, ch, text, lvid, sw, font=16):
 
 # setting name / value format (value goes in the chip): from cyd_settings.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cyd_settings import NUMBERS  # noqa: E402
+from cyd_settings import NUMBERS, VPAGES  # noqa: E402
 FMT = {n[0]: (n[7], n[8]) for n in NUMBERS if n[7]}
 MAXV = {n[0]: n[4] for n in NUMBERS}
 
@@ -145,7 +145,10 @@ CHIP_X, CHIP_W = 156, 86            # value chip
 BTN_X, BTN_W = 246, 72              # - / + buttons
 
 
-def num_rows(nids, y0=42, y1=NAV_Y - 2):
+ROWREC = {}          # virtual page id -> row layouts (for the shared settings page table)
+
+
+def num_rows(nids, y0=42, y1=NAV_Y - 2, rec=None):
     """Rows of  name | [value] | [-][+]  spread over y0..y1, one font for the whole page."""
     out, n = [], len(nids)
     pitch = (y1 - y0) // n
@@ -176,10 +179,22 @@ def num_rows(nids, y0=42, y1=NAV_Y - 2):
         out.append(bm(BTN_X, y + (pitch - bh) // 2, BTN_W, bh, [
             ("\\uF068", [f"number.decrement: {{ id: {nid}, cycle: false }}"]),
             ("\\uF067", [f"number.increment: {{ id: {nid}, cycle: false }}"])], font=16))
+        if rec is not None:
+            rec.append(dict(nid=nid, name=name, fmt=vf, ny=y + (pitch - th) // 2, nf=f,
+                            cy=y + (pitch - ch) // 2, cf=vfont, by=y + (pitch - bh) // 2, bh=bh))
     return out
 
 
 INFOG = ["page_i_power", "page_i_proj", "page_i_energy", "page_i_sys"]
+VIRT = [p for p, _, _, _ in VPAGES]              # shown on the shared page "page_set"
+REAL_CODE = {"page_s_rules": -1, "page_s_sound": -2, "page_s_disp": -3, "page_a_reset": -4}
+
+
+def goto(pid):
+    """Action that opens a page; a virtual settings page goes through the set_ui script."""
+    if pid in VIRT:
+        return f"script.execute: {{ id: set_ui, what: 4, slot: {VIRT.index(pid)}, dir: 0 }}"
+    return f"lvgl.page.show: {pid}"
 SETUP = ["page_s_res", "page_s_plan", "page_s_rules", "page_s_sound", "page_s_disp"]
 ADV = ["page_a_high1", "page_a_high2", "page_a_night1", "page_a_night2", "page_a_night3",
        "page_a_ovn1", "page_a_ovn2", "page_a_chg1", "page_a_chg2", "page_a_timing",
@@ -203,8 +218,8 @@ def header(pid):
     i = group.index(pid)
     return [label(6, 3, f"{name} {i + 1}/{len(group)}", font=14, color=NAME),
             label(6, 19, TITLES[pid], font=18, color=TITLE),
-            bm(240, 2, 78, 36, [("\\uF053", [f"lvgl.page.show: {group[i - 1]}"]),
-                                ("\\uF054", [f"lvgl.page.show: {group[(i + 1) % len(group)]}"])])]
+            bm(240, 2, 78, 36, [("\\uF053", [goto(group[i - 1])]),
+                                ("\\uF054", [goto(group[(i + 1) % len(group)])])])]
 
 
 GUARD = ("if:\n  condition: {{ binary_sensor.is_on: inv_link }}\n  then:\n"
@@ -377,9 +392,9 @@ def build():
     PAGES["page_control"] = c
 
     # ---------------- Setup
-    PAGES["page_s_res"] = header("page_s_res") + num_rows(
-        ["n_sunny_sw", "n_sunny_ret", "n_cloudy_sw", "n_cloudy_ret"])
-    PAGES["page_s_plan"] = header("page_s_plan") + num_rows(["n_cloudy_kwh", "n_chg_target"])
+    for pid, _, _, nids in VPAGES:          # virtual pages: laid out + checked here, shown on page_set
+        ROWREC[pid] = []
+        PAGES[pid] = header(pid) + num_rows(nids, rec=ROWREC[pid])
     r = header("page_s_rules")
     cells = [("Low batt", "lv_sw_rule_low", "sw_rule_low"),
              ("High load", "lv_sw_rule_high", "sw_rule_high"),
@@ -411,21 +426,7 @@ def build():
     d += sw_cell(6, 166, 170, 32, "Touch dot", "lv_sw_touchdbg", "sw_touchdbg")
     PAGES["page_s_disp"] = d
 
-    # ---------------- Advanced
-    rows = {"page_a_high1": ["n_high_on_w", "n_high_on_s", "n_high_off_w", "n_high_off_s"],
-            "page_a_high2": ["n_high_max_soc", "n_high_max_pv"],
-            "page_a_night1": ["n_night_on_w", "n_night_on_s", "n_night_max_soc"],
-            "page_a_night2": ["n_night_off_w", "n_night_off_s"],
-            "page_a_night3": ["n_back_soc", "n_back_w", "n_back_s"],
-            "page_a_ovn1": ["n_ovn_floor", "n_ovn_margin", "n_base_floor"],
-            "page_a_ovn2": ["n_sun_delay_sunny", "n_sun_delay_cloudy"],
-            "page_a_chg1": ["n_emerg_soc", "n_emerg_target", "n_fast_below"],
-            "page_a_chg2": ["n_chg_fast_a", "n_chg_norm_a", "n_chg_margin"],
-            "page_a_timing": ["n_low_delay", "n_min_sub", "n_float_v"],
-            "page_a_batt": ["n_batt_kwh", "n_empty_soc"],
-            "page_a_pv": ["n_pv_kwp", "n_pv_tilt", "n_pv_az"]}
-    for pid in ADV[:-1]:
-        PAGES[pid] = header(pid) + num_rows(rows[pid])
+    # ---------------- Advanced (pure-settings pages come from VPAGES above)
     PAGES["page_a_reset"] = header("page_a_reset") + [
         label(6, 46, "Sets every rule, threshold, sound and display setting back to its default.",
               font=16, w=308, wrap_=True, color=BTN_TXT),
@@ -634,7 +635,7 @@ def emit():
     w(f"""lvgl:
   displays: [tft]
   touchscreens: [touch]
-  buffer_size: 25%               # no PSRAM on the CYD
+  buffer_size: 10%               # no PSRAM: draw in strips of 10 % of the screen (RAM for HTTPS)
   # Layout generated by ui.py and checked against the real Montserrat glyph widths
   # (no overlaps, nothing outside the screen or under the nav bar).
   theme:
@@ -701,7 +702,7 @@ def emit():
           radius: 0
           pad_all: 0
           scrollable: false""")
-    widget(bm(0, NAV_Y, W, H - NAV_Y, [(s, [f"lvgl.page.show: {pg}"]) for s, pg in NAV],
+    widget(bm(0, NAV_Y, W, H - NAV_Y, [(s, [goto(pg)]) for s, pg in NAV],
               font=20, id="nav", item_bg=NAV_BTN, item_txt=NAV_TXT), 6)
     w(f"""      - label:
           id: lbl_alert
@@ -749,7 +750,9 @@ def emit():
           bg_opa: COVER
           border_width: 0
   pages:""")
-    for pid, ws in PAGES.items():
+    for pid, ws in list(PAGES.items()) + [("page_set", set_page_widgets())]:
+        if pid in VIRT:
+            continue
         w(f"    - id: {pid}")
         w(f"      scrollable: false")
         w(f"      bg_color: {hx(BG)}")
@@ -760,7 +763,133 @@ def emit():
     return "\n".join(o) + "\n"
 
 
+SET_ACT = "script.execute: {{ id: set_ui, what: {what}, slot: {slot}, dir: {dir} }}"
+
+
+def set_page_widgets():
+    """The one shared settings page: header + 4 row slots, filled by the set_ui script."""
+    ws = [label(6, 3, "", font=14, id="set_grp", sample="ADVANCED 12/13"),
+          label(6, 19, "", font=18, id="set_title", color=TITLE, sample="Forecast & charging"),
+          bm(240, 2, 78, 36, [("\\uF053", [SET_ACT.format(what=3, slot=0, dir=-1)]),
+                              ("\\uF054", [SET_ACT.format(what=3, slot=0, dir=1)])])]
+    for i in range(4):
+        y = 42 + i * 39
+        ws += [label(6, y, "", font=16, w=NAME_W, id=f"set_n{i}", wrap_=True, sample="-"),
+               chip(CHIP_X, y, CHIP_W, f"set_v{i}", "-", font=18, align="CENTER", text="--"),
+               bm(BTN_X, y, BTN_W, 35, [("\\uF068", [SET_ACT.format(what=2, slot=i, dir=-1)]),
+                                        ("\\uF067", [SET_ACT.format(what=2, slot=i, dir=1)])], font=16,
+                  id=f"set_b{i}")]
+    return ws
+
+
+def cstr(t):
+    return '"' + t.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def emit_set_script():
+    """set_ui(what, slot, dir): 0 show current, 1 refresh values, 2 step slot by dir,
+    3 page by dir (may leave to a real page), 4 open virtual page `slot`."""
+    groups = {"SETUP": SETUP, "ADVANCED": ADV}
+    rows_c = []
+    for k, (pid, grp, title, _) in enumerate(VPAGES):
+        g = groups[grp]
+        rr = []
+        for r in ROWREC[pid]:
+            rr.append(f"{{&id({r['nid']}), {cstr(r['name'])}, {cstr(r['fmt'])}, {r['ny']}, {r['cy']}, {r['by']}, "
+                      f"{r['bh']}, &lv_font_montserrat_{r['nf']}, &lv_font_montserrat_{r['cf']}}}")
+        rows_c.append(f"            {{{cstr(f'{grp} {g.index(pid) + 1}/{len(g)}')}, {cstr(title)}, {len(rr)}, {{{', '.join(rr)}}}}}")
+
+    def seq(g):
+        return ", ".join(str(VIRT.index(p)) if p in VIRT else str(REAL_CODE[p]) for p in g)
+    n_setup_v = sum(1 for p in SETUP if p in VIRT)
+    lines = f"""  # Shared settings page (generated by cyd_ui.py). One screen page shows the {len(VIRT)} settings
+  # pages in turn, so their widgets exist only once in RAM.
+  #   what: 0 show current, 1 refresh values, 2 step row `slot` by `dir`, 3 page by `dir`,
+  #         4 open virtual page `slot`
+  - id: set_ui
+    mode: queued
+    max_runs: 6
+    parameters:
+      what: int
+      slot: int
+      dir: int
+    then:
+      - lambda: |-
+          struct Row {{ number::Number *n; const char *name, *fmt; int16_t ny, cy, by, bh; const lv_font_t *nf, *cf; }};
+          struct Pg {{ const char *grp, *title; uint8_t nrows; Row r[4]; }};
+          static const Pg P[] = {{
+{(','+chr(10)).join(rows_c)}
+          }};
+          static const int8_t SEQ_S[] = {{{seq(SETUP)}}};    // <0 = real page: -1 rules, -2 sound, -3 display, -4 reset
+          static const int8_t SEQ_A[] = {{{seq(ADV)}}};
+          lv_obj_t *const N[4] = {{set_n0, set_n1, set_n2, set_n3}};
+          lv_obj_t *const V[4] = {{set_v0, set_v1, set_v2, set_v3}};
+          lv_obj_t *const B[4] = {{set_b0->obj, set_b1->obj, set_b2->obj, set_b3->obj}};
+          id(set_goto) = 0;
+          int k = id(set_idx), w = what;
+          if (w == 4) {{ k = slot; w = 0; id(set_goto) = 1; }}
+          else if (w == 3) {{
+            const bool setup = k < {n_setup_v};
+            const int8_t *sq = setup ? SEQ_S : SEQ_A;
+            const int n = setup ? (int) sizeof(SEQ_S) : (int) sizeof(SEQ_A);
+            int pos = 0;
+            for (int i = 0; i < n; i++) if (sq[i] == k) pos = i;
+            const int8_t t = sq[(pos + dir + n) % n];
+            if (t < 0) {{ id(set_goto) = t; return; }}
+            k = t; w = 0;
+          }} else if (w == 2) {{
+            if (slot < P[k].nrows) {{
+              auto c = P[k].r[slot].n->make_call();
+              if (dir > 0) c.number_increment(false); else c.number_decrement(false);
+              c.perform();                                // its on_value refreshes the values
+            }}
+            return;
+          }}
+          if (N[0] == nullptr) return;                    // screen not built yet
+          id(set_idx) = k;
+          const Pg &p = P[k];
+          if (w == 0) {{
+            lv_label_set_text(set_grp, p.grp);
+            lv_label_set_text(set_title, p.title);
+            for (int i = 0; i < 4; i++) {{
+              if (i >= p.nrows) {{
+                lv_obj_add_flag(N[i], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(V[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(B[i], LV_OBJ_FLAG_HIDDEN);
+                continue;
+              }}
+              const Row &r = p.r[i];
+              lv_obj_remove_flag(N[i], LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(V[i], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_remove_flag(B[i], LV_OBJ_FLAG_HIDDEN);
+              lv_label_set_text(N[i], r.name);
+              lv_obj_set_style_text_font(N[i], r.nf, LV_PART_MAIN);
+              lv_obj_set_y(N[i], r.ny);
+              lv_obj_set_style_text_font(V[i], r.cf, LV_PART_MAIN);
+              lv_obj_set_y(V[i], r.cy);
+              lv_obj_set_y(B[i], r.by);
+              lv_obj_set_height(B[i], r.bh);
+            }}
+          }}
+          for (int i = 0; i < p.nrows; i++)
+            lv_label_set_text(V[i], str_sprintf(p.r[i].fmt, p.r[i].n->state).c_str());
+      - if:
+          condition:
+            lambda: 'return id(set_goto) == 1;'
+          then: [ lvgl.page.show: page_set ]
+"""
+    for pid, code in REAL_CODE.items():
+        lines += f"""      - if:
+          condition:
+            lambda: 'return id(set_goto) == {code};'
+          then: [ lvgl.page.show: {pid} ]
+"""
+    return lines
+
+
 def emit_script():
+    return emit_ui_script() + "\n" + emit_set_script()
+
+
+def emit_ui_script():
     """ui_refresh_values: fills the Home / Power / Info value chips (N/A without inverter data)."""
     o = ["  # Home / Power / Info value chips. Generated by ui.py. N/A when there is no fresh inverter data.",
          "  - id: ui_refresh_values",

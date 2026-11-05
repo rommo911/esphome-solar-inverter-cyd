@@ -38,6 +38,21 @@ later as a viewer and remote.
 
 Only one controller may be on the inverter's RS232 port at a time.
 
+### Memory (no PSRAM)
+The ESP32 has 520 KB of internal RAM; the compile line "RAM … of 180736 bytes" only counts the
+static-data region. What matters at runtime is the heap, which HTTPS needs about 45 KB of (one
+24 KB block). To keep it free:
+- the screen is drawn in strips of 10 % (`buffer_size: 10%`);
+- WiFi keeps 6 static receive buffers instead of 10 (and fewer dynamic / management buffers);
+- the 14 settings-only pages are **one** screen page (`page_set`) that the `set_ui` script refills
+  as you page through them, so their widgets exist once in RAM instead of 14 times;
+- TLS buffers are allocated only during a fetch (mbedTLS dynamic buffers).
+
+At boot the log shows `[mem]` lines with the free heap before and after the screen and WiFi start;
+Info → System shows the current values.
+
+Flash: quad SPI (QIO) at 80 MHz; `minimum_chip_revision: "3.1"` (this board's chip).
+
 ## How it decides
 
 ### Safety rules (always)
@@ -320,7 +335,7 @@ command line while a dashboard build runs: they share one build folder.
 | Part | Source | Apply |
 |---|---|---|
 | `number:` / `switch:`, `ui_sync_all`, `restore_defaults` | `tools/cyd_settings.py` | `python3 tools/cyd_settings_apply.py inverter-cyd.yaml` |
-| `lvgl:` section, `ui_refresh_values` | `tools/cyd_ui.py` | run `cyd_ui.py check / render / yaml / script` in the container, then `tools/cyd_ui_inject.py` |
+| `lvgl:` section, `ui_refresh_values`, `set_ui` (shared settings page) | `tools/cyd_ui.py` (pages of settings rows: `VPAGES` in `cyd_settings.py`) | run `cyd_ui.py check / render / yaml / script` in the container, then `tools/cyd_ui_inject.py` |
 | Settings tables in this README | `tools/cyd_settings.py` | `python3 tools/cyd_readme.py README.md` |
 
 `cyd_ui.py check` verifies against LVGL's real Montserrat glyph widths that no text overlaps or

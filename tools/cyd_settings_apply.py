@@ -10,7 +10,7 @@ import re
 import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from cyd_settings import NUMBERS, SWITCHES  # noqa: E402
+from cyd_settings import NUMBERS, SWITCHES, VIRTUAL_NIDS  # noqa: E402
 
 path = sys.argv[1]
 s = open(path).read()
@@ -72,6 +72,14 @@ def number_yaml(n):
         y += f"""    on_value:
       - lambda: 'id(led_{nid[-1]}).set_max_power(x / 100.0f);'
 """
+    elif nid in VIRTUAL_NIDS:      # shown on the shared settings page: refresh its values
+        y += """    on_value:
+      - if:
+          condition:
+            lambda: 'return id(boot_ms) != 0;'
+          then:
+            - script.execute: { id: set_ui, what: 1, slot: 0, dir: 0 }
+"""
     elif label:
         y += f"""    on_value:
       - if:
@@ -122,8 +130,9 @@ s = s[:a] + ("switch:\n  # Generated from tools/cyd_settings.py.\n"
 # ui_sync_all / restore_defaults
 a, b = script_span("ui_sync_all")
 sync = "  - id: ui_sync_all\n    then:\n"
+sync += "      - script.execute: { id: set_ui, what: 1, slot: 0, dir: 0 }\n"
 for n in NUMBERS:
-    if n[7]:
+    if n[7] and n[0] not in VIRTUAL_NIDS:
         sync += (f"      - lvgl.label.update: {{ id: lb_{n[0]}, text: !lambda "
                  f"'return str_sprintf(\"{n[8]}\", id({n[0]}).state);' }}\n")
 for w in SWITCHES:

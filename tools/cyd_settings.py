@@ -83,3 +83,24 @@ SWITCHES = [
 ]
 
 BY_ID = {n[0]: n for n in NUMBERS}
+
+# Settings pages that consist only of setting rows. On the device they are ONE screen page
+# ("page_set") whose rows are refilled when you page through them (saves ~150 widgets of RAM).
+# (page id, group, title, setting ids) - order = order on screen within the group.
+VPAGES = [
+    ("page_s_res", "SETUP", "Battery reserve", ["n_sunny_sw", "n_sunny_ret", "n_cloudy_sw", "n_cloudy_ret"]),
+    ("page_s_plan", "SETUP", "Forecast & charging", ["n_cloudy_kwh", "n_chg_target"]),
+    ("page_a_high1", "ADVANCED", "High load", ["n_high_on_w", "n_high_on_s", "n_high_off_w", "n_high_off_s"]),
+    ("page_a_high2", "ADVANCED", "High load limits", ["n_high_max_soc", "n_high_max_pv"]),
+    ("page_a_night1", "ADVANCED", "Night load on", ["n_night_on_w", "n_night_on_s", "n_night_max_soc"]),
+    ("page_a_night2", "ADVANCED", "Night load off", ["n_night_off_w", "n_night_off_s"]),
+    ("page_a_night3", "ADVANCED", "Night release 2", ["n_back_soc", "n_back_w", "n_back_s"]),
+    ("page_a_ovn1", "ADVANCED", "Overnight", ["n_ovn_floor", "n_ovn_margin", "n_base_floor"]),
+    ("page_a_ovn2", "ADVANCED", "Overnight sun delay", ["n_sun_delay_sunny", "n_sun_delay_cloudy"]),
+    ("page_a_chg1", "ADVANCED", "Grid charging", ["n_emerg_soc", "n_emerg_target", "n_fast_below"]),
+    ("page_a_chg2", "ADVANCED", "Charge current", ["n_chg_fast_a", "n_chg_norm_a", "n_chg_margin"]),
+    ("page_a_timing", "ADVANCED", "Timing", ["n_low_delay", "n_min_sub", "n_float_v"]),
+    ("page_a_batt", "ADVANCED", "Battery capacity", ["n_batt_kwh", "n_empty_soc"]),
+    ("page_a_pv", "ADVANCED", "Solar panels", ["n_pv_kwp", "n_pv_tilt", "n_pv_az"]),
+]
+VIRTUAL_NIDS = {nid for _, _, _, nids in VPAGES for nid in nids}
