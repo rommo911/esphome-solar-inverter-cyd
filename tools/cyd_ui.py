@@ -795,7 +795,7 @@ def emit_set_script():
         g = groups[grp]
         rr = []
         for r in ROWREC[pid]:
-            rr.append(f"{{&id({r['nid']}), {cstr(r['name'])}, {cstr(r['fmt'])}, {r['ny']}, {r['cy']}, {r['by']}, "
+            rr.append(f"{{id({r['nid']}), {cstr(r['name'])}, {cstr(r['fmt'])}, {r['ny']}, {r['cy']}, {r['by']}, "
                       f"{r['bh']}, &lv_font_montserrat_{r['nf']}, &lv_font_montserrat_{r['cf']}}}")
         rows_c.append(f"            {{{cstr(f'{grp} {g.index(pid) + 1}/{len(g)}')}, {cstr(title)}, {len(rr)}, {{{', '.join(rr)}}}}}")
 
