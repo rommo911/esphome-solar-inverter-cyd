@@ -2,6 +2,12 @@
 
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
+#ifdef USE_WIFI
+#include "esphome/components/wifi/wifi_component.h"
+#endif
+#ifdef USE_ESP32
+#include <esp_heap_caps.h>
+#endif
 
 namespace esphome {
 namespace solar_autopilot {
@@ -49,6 +55,9 @@ void SolarAutopilot::setup() {
   });
   this->set_interval("minute", 60000, [this]() {
     autopilot_core::Actions a;
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+    this->forecast_minute_();
+#endif
     this->ctl_.minute(this->clock_(), this->inputs_(), this->settings_(), a);
     this->run_(a);
     this->save_();
@@ -96,6 +105,10 @@ autopilot_core::Inputs SolarAutopilot::inputs_() {
   in.charge_current = st(this->cur_rb_);
   in.float_voltage = st(this->float_rb_);
   in.solar_today_kwh = st(this->solar_today_);
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+  in.forecast_today_kwh = this->forecast_.today_kwh();
+  in.forecast_tomorrow_kwh = this->forecast_.tomorrow_kwh();
+#endif
   if (this->fc_today_.has_value()) in.forecast_today_kwh = this->fc_today_.value();
   if (this->fc_tomorrow_.has_value()) in.forecast_tomorrow_kwh = this->fc_tomorrow_.value();
   return in;
@@ -166,15 +179,104 @@ void SolarAutopilot::publish_(bool minute) {
     autopilot_core::describe(st, s, link, buf, sizeof buf);
     if (!this->state_text_->has_state() || this->state_text_->state != buf) this->state_text_->publish_state(buf);
   }
+  if (this->forecast_text_ != nullptr &&
+      (!this->forecast_text_->has_state() || this->forecast_text_->state != this->forecast_.detail()))
+    this->forecast_text_->publish_state(this->forecast_.detail());
 #endif
   if (!minute) return;
   const float soc = link ? in.soc : NAN;
+  const autopilot_core::Clock c = this->clock_();
   const float val[OUT_SENSOR_COUNT] = {
       st.reserve_sw, st.reserve_ret, st.plan_fc, st.soc_at_sun, st.base_load,
-      autopilot_core::battery_remaining_kwh(soc, s), autopilot_core::battery_runtime_h(soc, st.base_load, s)};
+      autopilot_core::battery_remaining_kwh(soc, s), autopilot_core::battery_runtime_h(soc, st.base_load, s),
+      in.forecast_today_kwh, in.forecast_tomorrow_kwh,
+      c.valid ? this->forecast_.power_at(c.hour * 60 + c.minute) : NAN};
   for (uint8_t i = 0; i < OUT_SENSOR_COUNT; i++)
     if (this->out_sensors_[i] != nullptr) this->out_sensors_[i]->publish_state(val[i]);
 }
+
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+// Forecast.Solar: day totals, then 2 s later today's power curve. The GET blocks the loop for a
+// few seconds (TLS handshake), as the http_request action does.
+void SolarAutopilot::forecast_minute_() {
+  const autopilot_core::Clock c = this->clock_();
+  this->forecast_.tick(c);
+  bool wifi_ok = true;
+#ifdef USE_WIFI
+  wifi_ok = wifi::global_wifi_component->is_connected();
+#endif
+  if (!this->forecast_.due(c.ms, this->settings_(), wifi_ok, c.valid)) return;
+  this->forecast_.fetch_started(c.ms);
+  this->fetch_(autopilot_core::Forecast::DAY_TOTALS);
+  if (this->forecast_.ok())
+    this->set_timeout("forecast_watts", 2000, [this]() { this->fetch_(autopilot_core::Forecast::WATTS); });
+}
+
+// HTTPS needs ~40 KB of heap for TLS on a board without PSRAM: skip rather than fail half-way.
+bool SolarAutopilot::room_for_tls_() {
+#ifdef USE_ESP32
+  const size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const size_t fre = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  if (blk < 24000 || fre < 45000) {
+    char d[120];
+    snprintf(d, sizeof d, "not enough memory for HTTPS (free %u B, largest block %u B; need 45000 / 24000)",
+             (unsigned) fre, (unsigned) blk);
+    this->forecast_.skipped("low memory", d);
+    ESP_LOGW("fc", "%s", this->forecast_.detail());
+    return false;
+  }
+#endif
+  return true;
+}
+
+void SolarAutopilot::fetch_(autopilot_core::Forecast::Kind kind) {
+  const bool day = kind == autopilot_core::Forecast::DAY_TOTALS;
+  if (!this->room_for_tls_()) return;
+  char url[160];
+  this->forecast_.url(kind, this->settings_(), url, sizeof url);
+#ifdef USE_ESP32
+  ESP_LOGW("fc", "GET %s (free %u B, block %u B)", url, (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+#else
+  ESP_LOGW("fc", "GET %s", url);
+#endif
+  auto resp = this->http_->get(url);
+  if (resp == nullptr) {
+    if (day) this->forecast_.connect_failed("day totals");
+    ESP_LOGW("fc", "%s: connection / TLS failed (see the http_request error above)", day ? "day totals" : "power curve");
+    return;
+  }
+  // read the reply (day totals ~200 B, power curve ~2 KB; a cut-short reply still gives what came)
+  const size_t max = day ? 1024 : 4096;
+  std::string body(max, '\0');
+  size_t n = 0;
+  uint32_t last = millis();
+  while (n < max) {
+    const int r = resp->read(reinterpret_cast<uint8_t *>(&body[n]), max - n);
+    const auto res = http_request::http_read_loop_result(r, last, 10000, resp->is_read_complete());
+    if (res == http_request::HttpReadLoopResult::RETRY) continue;
+    if (res != http_request::HttpReadLoopResult::DATA) break;
+    n += r;
+  }
+  const int code = resp->status_code;
+  resp->end();
+  body.resize(n);
+  ESPTime t = this->time_->now();
+  if (!t.is_valid()) return;
+  char today[11], tomorrow[11], hhmm[6];
+  t.strftime(today, sizeof today, "%Y-%m-%d");
+  ESPTime::from_epoch_local(t.timestamp + 86400).strftime(tomorrow, sizeof tomorrow, "%Y-%m-%d");
+  t.strftime(hhmm, sizeof hhmm, "%H:%M");
+  if (day) {
+    this->forecast_.day_totals(code, body.c_str(), n, today, tomorrow, hhmm, millis());
+    ESP_LOGW("fc", "%s", this->forecast_.detail());
+  } else if (this->forecast_.watts(code, body.c_str(), n, today)) {
+    ESP_LOGW("fc", "power curve: %u points for today", (unsigned) this->forecast_.points());
+  } else {
+    ESP_LOGW("fc", "%s", this->forecast_.detail());
+  }
+}
+#endif
 
 void SolarAutopilot::save_() {
   const autopilot_core::Persist p = this->ctl_.persist();

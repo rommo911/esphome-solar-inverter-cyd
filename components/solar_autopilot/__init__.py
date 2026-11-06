@@ -4,9 +4,9 @@ this file and solar_autopilot.{h,cpp} only connect it to entities."""
 
 from esphome import automation
 import esphome.codegen as cg
-from esphome.components import binary_sensor, number, select, sensor, sun, switch, time
+from esphome.components import binary_sensor, http_request, number, select, sensor, sun, switch, time
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_TIME_ID, CONF_TRIGGER_ID
+from esphome.const import CONF_ID, CONF_LATITUDE, CONF_LONGITUDE, CONF_TIME_ID, CONF_TRIGGER_ID
 
 from .settings_keys import NUMBERS, SWITCHES
 
@@ -27,6 +27,17 @@ CONF_REPEAT_SOC = "alarm_repeat_soc"
 CONF_SETTINGS = "settings"
 CONF_ON_TUNE = "on_tune"
 CONF_ON_NOTIFY = "on_notify"
+CONF_FORECAST = "forecast"
+
+# Forecast.Solar: fetched by the component (needs http_request:). The plane (kWp, tilt, azimuth)
+# and the refresh interval are settings (pv_kwp, pv_tilt, pv_az, fc_interval_h).
+FORECAST_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(http_request.CONF_HTTP_REQUEST_ID): cv.use_id(http_request.HttpRequestComponent),
+        cv.Required(CONF_LATITUDE): cv.float_range(min=-90, max=90),
+        cv.Required(CONF_LONGITUDE): cv.float_range(min=-180, max=180),
+    }
+)
 
 # readings
 SENSORS = {
@@ -65,6 +76,8 @@ CONFIG_SCHEMA = cv.Schema(
         **{(cv.Required(k) if k in REQUIRED_SENSORS else cv.Optional(k)): cv.use_id(sensor.Sensor) for k in SENSORS},
         cv.Required("grid"): cv.use_id(binary_sensor.BinarySensor),
         cv.Optional("floating"): cv.use_id(binary_sensor.BinarySensor),
+        cv.Optional(CONF_FORECAST): FORECAST_SCHEMA,
+        # forecast from elsewhere instead (kWh), e.g. Home Assistant
         **{cv.Optional(k): cv.templatable(cv.float_) for k in TEMPLATES},
         cv.Required("output_priority"): cv.use_id(select.Select),
         cv.Optional("charger_source"): cv.use_id(select.Select),
@@ -91,6 +104,11 @@ async def to_code(config):
         for key, setter in table.items():
             if key in config:
                 cg.add(getattr(var, setter)(await cg.get_variable(config[key])))
+    if CONF_FORECAST in config:
+        fc = config[CONF_FORECAST]
+        cg.add_define("USE_SOLAR_AUTOPILOT_FORECAST")
+        http = await cg.get_variable(fc[http_request.CONF_HTTP_REQUEST_ID])
+        cg.add(var.set_forecast(http, fc[CONF_LATITUDE], fc[CONF_LONGITUDE]))
     for key, setter in TEMPLATES.items():
         if key in config:
             cg.add(getattr(var, setter)(await cg.templatable(config[key], [], cg.float_)))

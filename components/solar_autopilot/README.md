@@ -121,6 +121,31 @@ For screen lambdas, everything is also available directly: `id(autopilot).status
 and `id(autopilot).link()`. Status covers reasons, want_sub, cloudy, charging, soc_at_sun,
 base_load, fault and more.
 
+**Forecast.** With a `forecast:` block, the component fetches Forecast.Solar itself. That's
+the free API with no key, and it needs `http_request:`. It gets the day totals for today and
+tomorrow, then today's power curve. It fetches every `fc_interval_h` hours, retries every minute
+after a failure, and waits 15 min after HTTP 429. The panel plane comes from the `pv_kwp`,
+`pv_tilt` and `pv_az` settings.
+
+```yaml
+solar_autopilot:
+  forecast: { latitude: 36.15, longitude: 36.73 }
+sensor:
+  - platform: solar_autopilot
+    forecast_today: { name: "Solar Forecast Today" }
+    forecast_tomorrow: { name: "Solar Forecast Tomorrow" }
+    forecast_now: { name: "Solar Forecast Now" }     # W, from today's curve
+text_sensor:
+  - platform: solar_autopilot
+    forecast_status: { name: "Forecast Status" }    # "ok 14:05: today 7.3 kWh, ..." / "HTTP 429: ..."
+```
+
+Screen lambdas: `id(autopilot).forecast().today_kwh()`, `.tomorrow_kwh()`, `.power_at(minute)` and
+`.status()`. Without a `forecast:` block you can feed `forecast_today` and `forecast_tomorrow` as
+lambdas, for example from Home Assistant. The core's `Forecast` class (`ap_forecast.h`) does the
+scheduling, the URLs and the reply parsing without a JSON library. On another platform you only
+do the HTTPS GET.
+
 Feed it the inverter replies with `id(autopilot).mark_data();` in a pipsolar sensor's
 `on_raw_value`. Unbound settings use their defaults. `inverter-cyd.yaml` is the complete
 example.

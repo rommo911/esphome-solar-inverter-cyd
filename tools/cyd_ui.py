@@ -255,7 +255,6 @@ _RT = ('float soc = id(s_soc).state, load = {load};\n'
        'float h = wh / std::max(load, 50.0f);\n'
        'if (h >= 99.0f) return std::string("> 99 h");\n'
        'return str_sprintf("%dh %02dm", (int) h, (int) ((h - (int) h) * 60));')
-_FC = 'float v = id({g});\nreturn isnan(v) ? std::string("N/A") : str_sprintf("%.1f kWh", v);'
 # Projections page values: id -> C++ returning std::string
 PROJ = {
     "x_left": ('float soc = id(s_soc).state;\n'
@@ -263,22 +262,10 @@ PROJ = {
                'return str_sprintf("%.2f kWh", std::max(0.0f, id(n_batt_kwh).state * (soc - id(n_empty_soc).state) / 100.0f));'),
     "x_rt_now": _RT.format(load="id(s_load_power).state"),
     "x_rt_1h": _RT.format(load="id(s_load_1h).state"),
-    "x_fc_now": ('const auto &c = id(fc_curve);\n'
-                 'auto t = id(sntp_time).now();\n'
-                 'if (c.empty() || !t.is_valid()) return std::string("N/A");\n'
-                 'int m = t.hour * 60 + t.minute;\n'
-                 'float v = 0;  // before the first / after the last point of the day = night\n'
-                 'for (size_t i = 1; i < c.size(); i++) {\n'
-                 '  if (m >= c[i - 1].first && m <= c[i].first) {\n'
-                 '    float f = float(m - c[i - 1].first) / std::max(1, c[i].first - c[i - 1].first);\n'
-                 '    v = c[i - 1].second + f * (c[i].second - c[i - 1].second);\n'
-                 '    break;\n'
-                 '  }\n'
-                 '}\n'
-                 'return str_sprintf("%.0f W", v);'),
-    "x_fc_today": _FC.format(g="fc_today_kwh"),
-    "x_fc_tmrw": _FC.format(g="fc_tomorrow_kwh"),
-    "lbl_fc_upd": 'return id(fc_status);',
+    "x_fc_now": 'auto t = id(sntp_time).now();\nconst float v = t.is_valid() ? id(autopilot).forecast().power_at(t.hour * 60 + t.minute) : NAN;\nreturn isnan(v) ? std::string("N/A") : str_sprintf("%.0f W", v);',
+    "x_fc_today": 'float v = id(autopilot).forecast().today_kwh();\nreturn isnan(v) ? std::string("N/A") : str_sprintf("%.1f kWh", v);',
+    "x_fc_tmrw": 'float v = id(autopilot).forecast().tomorrow_kwh();\nreturn isnan(v) ? std::string("N/A") : str_sprintf("%.1f kWh", v);',
+    "lbl_fc_upd": 'return std::string(id(autopilot).forecast().status());',
 }
 # Info page rows: (name, id, sample, C++ returning std::string)
 INFO = [

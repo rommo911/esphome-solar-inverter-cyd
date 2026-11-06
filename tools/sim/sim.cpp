@@ -119,6 +119,7 @@ Script<std::string> notify;
 // The controller logic is the C++ core (components/solar_autopilot); this is its adapter,
 // the same job the ESPHome component does on the device.
 #include "ap/autopilot.h"
+static float sim_fc_today = NAN, sim_fc_tomorrow = NAN;   // the forecast the world "fetched"
 struct SimAutopilot {
   autopilot_core::Controller ctl;
   uint32_t last_data = 0;
@@ -148,7 +149,7 @@ struct SimAutopilot {
     in.output_priority = s_output_source_priority.state; in.charger_source = s_charger_source_priority.state;
     in.charge_current = s_max_ac_charging_current.state; in.float_voltage = s_battery_float_voltage.state;
     in.solar_today_kwh = e_solar_today.state;
-    in.forecast_today_kwh = fc_today_kwh; in.forecast_tomorrow_kwh = fc_tomorrow_kwh;
+    in.forecast_today_kwh = sim_fc_today; in.forecast_tomorrow_kwh = sim_fc_tomorrow;
     return in;
   }
   void run(const autopilot_core::Actions &acts);
@@ -326,8 +327,13 @@ int main(int argc, char **argv) {
     LINK_UP = sc.link_up(sm);
     INV_IGNORES = sc.inv_ignores(sm);
     auto fc_of = [&](int d) { return d < (int) sc.fc.size() ? sc.fc[d] : sc.fc.back(); };
+#ifdef USE_CORE
+    sim_fc_today = (float) fc_of(day);
+    sim_fc_tomorrow = (float) fc_of(day + 1);
+#else
     fc_today_kwh = (float) fc_of(day);
     fc_tomorrow_kwh = (float) fc_of(day + 1);
+#endif
 
     // --- physics (1 s): Axpert. SUB + grid: grid feeds the load; "Solar and utility" also charges from grid.
     const bool sub = sel_output_source_priority.inverter == "Solar first (SUB)";
@@ -357,7 +363,12 @@ int main(int argc, char **argv) {
     if (TIME_VALID && new_minute && (int) fmod(m, 1440.0) == 23 * 60 + 59 && !isnan(e_solar_today.state))
       sol_yday_kwh = e_solar_today.state;               // on_time 23:59
 #endif
-    if ((int) fmod(m, 1440.0) == 0 && new_minute) { solar_today_wh = 0; fc_curve.clear(); }   // midnight
+    if ((int) fmod(m, 1440.0) == 0 && new_minute) {   // midnight
+      solar_today_wh = 0;
+#ifndef USE_CORE
+      fc_curve.clear();
+#endif
+    }
 
     // --- inverter readings every 2 s (pipsolar). on_raw_value refreshes the data watchdog.
     if (LINK_UP && SIM_MS % 2000 == 0) {

@@ -32,6 +32,13 @@ SENSORS = {
                                                         icon="mdi:battery", state_class=STATE_CLASS_MEASUREMENT)),
     "battery_runtime": ("OUT_BATTERY_RUNTIME", dict(unit_of_measurement=UNIT_HOUR, accuracy_decimals=1,
                                                     icon="mdi:timer-sand", state_class=STATE_CLASS_MEASUREMENT)),
+    # forecast (solar_autopilot: forecast:, or forecast_today / forecast_tomorrow lambdas)
+    "forecast_today": ("OUT_FORECAST_TODAY", dict(unit_of_measurement=UNIT_KILOWATT_HOURS, accuracy_decimals=1,
+                                                  icon="mdi:solar-power-variant")),
+    "forecast_tomorrow": ("OUT_FORECAST_TOMORROW", dict(unit_of_measurement=UNIT_KILOWATT_HOURS, accuracy_decimals=1,
+                                                        icon="mdi:solar-power-variant-outline")),
+    "forecast_now": ("OUT_FORECAST_NOW", dict(unit_of_measurement=UNIT_WATT, accuracy_decimals=0,
+                                              device_class=DEVICE_CLASS_POWER, state_class=STATE_CLASS_MEASUREMENT)),
 }
 
 CONFIG_SCHEMA = cv.Schema(

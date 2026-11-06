@@ -5,5 +5,6 @@
 #include "ap_actions.h"
 #include "ap_alarms.h"
 #include "ap_controller.h"
+#include "ap_forecast.h"
 #include "ap_settings.h"
 #include "ap_types.h"

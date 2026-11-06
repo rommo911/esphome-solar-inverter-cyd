@@ -2,6 +2,7 @@
 # setting key -> entity id it is usually bound to (n_<key> / sw_<key>)
 NUMBERS = {
     "cloudy_kwh": "n_cloudy_kwh",
+    "fc_interval_h": "n_fc_interval_h",
     "sunny_sw": "n_sunny_sw",
     "sunny_ret": "n_sunny_ret",
     "cloudy_sw": "n_cloudy_sw",
@@ -37,6 +38,9 @@ NUMBERS = {
     "back_s": "n_back_s",
     "batt_kwh": "n_batt_kwh",
     "empty_soc": "n_empty_soc",
+    "pv_kwp": "n_pv_kwp",
+    "pv_tilt": "n_pv_tilt",
+    "pv_az": "n_pv_az",
     "quiet_start": "n_quiet_start",
     "quiet_end": "n_quiet_end",
 }

@@ -15,6 +15,9 @@
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+#include "esphome/components/http_request/http_request.h"
+#endif
 
 #include <string>
 #include <vector>
@@ -30,7 +33,8 @@ class NotifyTrigger;
 // entities the component publishes (sensor.py / binary_sensor.py / text_sensor.py)
 enum OutSensor : uint8_t {
   OUT_RESERVE_SWITCH, OUT_RESERVE_RETURN, OUT_FORECAST_USED, OUT_SOC_AT_SUN, OUT_BASE_LOAD,
-  OUT_BATTERY_REMAINING, OUT_BATTERY_RUNTIME, OUT_SENSOR_COUNT
+  OUT_BATTERY_REMAINING, OUT_BATTERY_RUNTIME, OUT_FORECAST_TODAY, OUT_FORECAST_TOMORROW, OUT_FORECAST_NOW,
+  OUT_SENSOR_COUNT
 };
 enum OutBinary : uint8_t { OUT_LINK, OUT_CLOUDY, OUT_CHARGING, OUT_FAULT, OUT_BINARY_COUNT };
 
@@ -60,12 +64,19 @@ class SolarAutopilot : public Component {
   void set_charger_source(select::Select *s) { sel_chg_ = s; }
   void set_charge_current(select::Select *s) { sel_cur_ = s; }
   void set_float_voltage(select::Select *s) { sel_float_ = s; }
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+  void set_forecast(http_request::HttpRequestComponent *http, float latitude, float longitude) {
+    http_ = http;
+    forecast_.set_location(latitude, longitude);
+  }
+#endif
   void set_number(autopilot_core::NumberId id, number::Number *n) { numbers_[id] = n; }
   void set_switch(autopilot_core::SwitchId id, switch_::Switch *s) { switches_[id] = s; }
   void set_out_sensor(OutSensor k, sensor::Sensor *s) { out_sensors_[k] = s; }
   void set_out_binary(OutBinary k, binary_sensor::BinarySensor *b) { out_binaries_[k] = b; }
 #ifdef USE_TEXT_SENSOR
   void set_state_text(text_sensor::TextSensor *t) { state_text_ = t; }
+  void set_forecast_text(text_sensor::TextSensor *t) { forecast_text_ = t; }
 #endif
   void add_tune_trigger(TuneTrigger *t) { tune_triggers_.push_back(t); }
   void add_notify_trigger(NotifyTrigger *t) { notify_triggers_.push_back(t); }
@@ -77,6 +88,8 @@ class SolarAutopilot : public Component {
   bool sound_allowed(bool critical) { return autopilot_core::sound_allowed(this->settings_(), this->clock_(), critical); }
   autopilot_core::Status status() const { return ctl_.status(); }
   autopilot_core::Settings settings() { return this->settings_(); }
+  // forecast().today_kwh(), .tomorrow_kwh(), .power_at(minute), .status(), .last_reply_ms()
+  const autopilot_core::Forecast &forecast() const { return forecast_; }
 
  protected:
   autopilot_core::Clock clock_();
@@ -85,6 +98,13 @@ class SolarAutopilot : public Component {
   void run_(const autopilot_core::Actions &acts);
   void save_();
   void publish_(bool minute);
+#ifdef USE_SOLAR_AUTOPILOT_FORECAST
+  void forecast_minute_();
+  void fetch_(autopilot_core::Forecast::Kind kind);
+  bool room_for_tls_();
+  http_request::HttpRequestComponent *http_ = nullptr;
+#endif
+  autopilot_core::Forecast forecast_;
 
   autopilot_core::Controller ctl_;
   autopilot_core::AlarmConfig cfg_;
@@ -105,7 +125,7 @@ class SolarAutopilot : public Component {
   sensor::Sensor *out_sensors_[OUT_SENSOR_COUNT] = {};
   binary_sensor::BinarySensor *out_binaries_[OUT_BINARY_COUNT] = {};
 #ifdef USE_TEXT_SENSOR
-  text_sensor::TextSensor *state_text_ = nullptr;
+  text_sensor::TextSensor *state_text_ = nullptr, *forecast_text_ = nullptr;
 #endif
   std::vector<TuneTrigger *> tune_triggers_;
   std::vector<NotifyTrigger *> notify_triggers_;

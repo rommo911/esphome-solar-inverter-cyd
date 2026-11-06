@@ -8,6 +8,7 @@ namespace autopilot_core {
 // X(key, default)
 #define AUTOPILOT_NUMBERS(X) \
   X(cloudy_kwh, 5.0f) \
+  X(fc_interval_h, 2.0f) \
   X(sunny_sw, 18.0f) \
   X(sunny_ret, 25.0f) \
   X(cloudy_sw, 25.0f) \
@@ -43,6 +44,9 @@ namespace autopilot_core {
   X(back_s, 10.0f) \
   X(batt_kwh, 4.5f) \
   X(empty_soc, 5.0f) \
+  X(pv_kwp, 2.0f) \
+  X(pv_tilt, 40.0f) \
+  X(pv_az, 0.0f) \
   X(quiet_start, 1.0f) \
   X(quiet_end, 9.0f) \
 
@@ -89,6 +93,7 @@ struct NumberInfo {
 };
 static const NumberInfo NUMBER_INFO[NUMBER_COUNT] = {
     {"cloudy_kwh", "Cloudy Below", "kWh", 0.0f, 20.0f, 0.5f, 5.0f},
+    {"fc_interval_h", "Forecast Refresh", "h", 2.0f, 8.0f, 1.0f, 2.0f},
     {"sunny_sw", "Sunny Day Switch SOC", "%", 16.0f, 37.0f, 1.0f, 18.0f},
     {"sunny_ret", "Sunny Day Return SOC", "%", 25.0f, 40.0f, 1.0f, 25.0f},
     {"cloudy_sw", "Cloudy Day Switch SOC", "%", 16.0f, 37.0f, 1.0f, 25.0f},
@@ -124,6 +129,9 @@ static const NumberInfo NUMBER_INFO[NUMBER_COUNT] = {
     {"back_s", "Night Release Delay", "s", 0.0f, 120.0f, 5.0f, 10.0f},
     {"batt_kwh", "Battery Capacity", "kWh", 1.0f, 30.0f, 0.1f, 4.5f},
     {"empty_soc", "Battery Empty At", "%", 0.0f, 30.0f, 1.0f, 5.0f},
+    {"pv_kwp", "PV Array Size", "kWp", 0.5f, 20.0f, 0.1f, 2.0f},
+    {"pv_tilt", "PV Tilt", "°", 0.0f, 90.0f, 1.0f, 40.0f},
+    {"pv_az", "PV Azimuth", "°", -180.0f, 180.0f, 5.0f, 0.0f},
     {"quiet_start", "Quiet Hours From", "h", 0.0f, 23.0f, 1.0f, 1.0f},
     {"quiet_end", "Quiet Hours Until", "h", 0.0f, 23.0f, 1.0f, 9.0f},
 };

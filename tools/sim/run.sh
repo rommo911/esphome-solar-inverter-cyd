@@ -12,6 +12,7 @@ DEF=""; SRC=""
 if [ -n "$CORE" ] || grep -q '^solar_autopilot:' "$Y"; then DEF="-DUSE_CORE"; SRC="ap/ap_*.cpp"; fi
 docker exec esphome sh -c 'rm -rf /tmp/sim && mkdir -p /tmp/sim/gen /tmp/sim/ap'
 docker cp sim.cpp esphome:/tmp/sim/sim.cpp
+docker cp test_forecast.cpp esphome:/tmp/sim/test_forecast.cpp
 docker cp gen/lambdas.inc esphome:/tmp/sim/gen/lambdas.inc
 docker cp gen/entities.inc esphome:/tmp/sim/gen/entities.inc
 for f in $C/ap_*.h $C/ap_*.cpp $C/autopilot.h; do docker cp "$f" esphome:/tmp/sim/ap/; done
@@ -19,3 +20,4 @@ echo "build: ${DEF:-YAML lambdas}"
 docker exec esphome sh -c "cd /tmp/sim && g++ -std=c++17 -O2 -Wall -Wno-unused-function $DEF -o sim sim.cpp $SRC && mkdir out && for s in \$(./sim | cut -f1); do ./sim \$s > out/\$s.jsonl; done"
 for f in $(docker exec esphome ls /tmp/sim/out); do docker cp esphome:/tmp/sim/out/$f "$R/$f"; done
 python3 -I check.py "$R" | tail -1
+docker exec esphome sh -c "cd /tmp/sim && g++ -std=c++17 -O2 -Wall -Wextra -o tf test_forecast.cpp ap/ap_forecast.cpp && ./tf"
