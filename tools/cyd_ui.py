@@ -233,7 +233,7 @@ TITLES = {
     "page_a_night1": "Night load on", "page_a_night2": "Night load off", "page_a_night3": "Night release 2",
     "page_a_ovn1": "Overnight", "page_a_ovn2": "Overnight sun delay",
     "page_a_chg1": "Grid charging", "page_a_chg2": "Charge current", "page_a_timing": "Timing",
-    "page_a_batt": "Battery capacity", "page_a_pv": "Solar panels", "page_a_reset": "Restore defaults",
+    "page_a_batt": "Battery capacity", "page_a_pv": "Solar panels", "page_a_reset": "Reset & reboot",
 }
 
 
@@ -257,7 +257,6 @@ LIVE = {
     "v_load": ("id(s_load_power).state", "%.0f W", True),
     "v_pv": ("id(s_pv_power).state", "%.0f W", True),
     "v_grid": ("id(grid_power).state", "%.0f W", True),
-    "v_sun": ("id(e_solar_today).state", "%.2f kWh", False),
     "p_pv": ("id(s_pv_power).state", "%.0f W", True),
     "p_load": ("id(s_load_power).state", "%.0f W", True),
     "p_batt": ("id(batt_power).state", "%+.0f W", True),
@@ -293,10 +292,10 @@ struct Badge { lv_obj_t *o; bool on; };
 const Badge badges[] = {{id(hm_b_observe), set.auto_ctl && set.observe}, {id(hm_b_manual), !set.auto_ctl},
                         {id(hm_b_fault), st.fault}, {id(hm_b_low), link && (r & 1)}, {id(hm_b_high), link && (r & 2)},
                         {id(hm_b_night), link && (r & 4)}, {id(hm_b_ovn), link && (r & 8)}, {id(hm_b_chg), link && (r & 16)}};
-int bx = 58;
+int bx = 56;
 for (const auto &b : badges) {
   show(b.o, b.on);
-  if (b.on) { lv_obj_set_x(b.o, bx); bx += 23; }
+  if (b.on) { lv_obj_set_x(b.o, bx); bx += 22; }
 }
 // battery in the middle: charging / discharging / idle and its power (batt_power: + = discharge)
 const float bw = id(batt_power).state;
@@ -372,6 +371,14 @@ RESET_ACTION = ("if:\n  condition:\n"
                 "  else:\n    - lambda: 'id(reset_armed) = millis();'\n"
                 "    - script.execute: { id: toast, msg: \"Tap again within 5 s to restore defaults\" }")
 
+REBOOT_ACTION = ("if:\n  condition:\n"
+                 "    lambda: 'return id(reboot_armed) != 0 && millis() - id(reboot_armed) < 5000;'\n"
+                 "  then:\n    - lambda: 'id(reboot_armed) = 0;'\n"
+                 "    - script.execute: { id: toast, msg: \"Rebooting...\" }\n"
+                 "    - delay: 1s\n    - lambda: 'App.safe_reboot();'\n"
+                 "  else:\n    - lambda: 'id(reboot_armed) = millis();'\n"
+                 "    - script.execute: { id: toast, msg: \"Tap again within 5 s to reboot\" }")
+
 PAGES = {}
 # reason / mode badges on Home, in display order: (icon key, colour)
 BADGES = [("observe", 0x9AA8B5), ("manual", 0xFFB300), ("fault", 0xE53935), ("low", 0xE53935),
@@ -401,9 +408,8 @@ def build():
     # right column: icon + value (zero = dimmed dash)
     for i, (ico, iid, vid, smp, col) in enumerate([("ico_pv", "hm_ic_pv", "v_pv", "12345 W", PV_COL),
                                                   ("ico_load", "hm_ic_load", "v_load", "12345 W", LOAD_COL),
-                                                  ("ico_grid", "hm_ic_grid", "v_grid", "12345 W", GOOD),
-                                                  ("ico_sun", "hm_ic_sun", "v_sun", "99.99 kWh", VAL)]):
-        y = 4 + i * 35
+                                                  ("ico_grid", "hm_ic_grid", "v_grid", "12345 W", GOOD)]):
+        y = 6 + i * 44
         p += [img(150, y + (ch20 - 24) // 2, 24, 24, iid, ico, col),
               chip(180, y, 138, vid, smp, font=20)]
     # status row: power path + reason badges (packed left by the refresh lambda) + "battery empty ~4am"
@@ -411,9 +417,9 @@ def build():
               alt="path")
           for k, c in (("batt", GOOD), ("grid", GRID_BTN), ("chg", 0x29B6F6))]
     for i, (k, c) in enumerate(BADGES):
-        p.append(img(58 + i * 23, 149, 22, 22, f"hm_b_{k}", f"ico_{k}", c, hidden=True, preview=k in ("low", "chg")))
-    p += [img(244, 150, 20, 20, "hm_empty", "ico_empty", BAD, hidden=True),
-          label(265, 151, "", font=16, w=53, id="hm_empty_t", sample="~12am", color=BAD)]
+        p.append(img(56 + i * 22, 149, 22, 22, f"hm_b_{k}", f"ico_{k}", c, hidden=True, preview=k in ("low", "chg")))
+    p += [img(234, 150, 20, 20, "hm_empty", "ico_empty", BAD, hidden=True),
+          label(255, 151, "", font=16, w=63, id="hm_empty_t", sample="~12am", color=BAD)]
     # bottom row: clock | inverter, Home Assistant, WiFi
     p += [label(6, 177, "", font=16, id="lbl_clock", sample="23:59", color=NAME),
           img(252, 178, 18, 18, "ic_inv", "ico_inverter", BAD),
@@ -518,11 +524,12 @@ def build():
 
     # ---------------- Advanced (pure-settings pages come from VPAGES above)
     PAGES["page_a_reset"] = header("page_a_reset") + [
-        label(6, 46, "Sets every rule, threshold, sound and display setting back to its default.",
-              font=16, w=308, wrap_=True, color=BTN_TXT),
-        label(6, 86, "Keeps the touch and light-sensor calibration.", font=14, w=308, wrap_=True),
-        button(40, 122, 240, 48, "Restore defaults", [RESET_ACTION], BAD),
-        label(6, 176, "Tap twice within 5 s to confirm.", font=14, w=308, align="CENTER")]
+        label(6, 40, "Restore defaults: every rule, threshold, sound and display setting back to its default "
+                     "(touch and light calibration are kept).", font=16, w=308, wrap_=True, color=BTN_TXT),
+        button(6, 116, 152, 46, "Restore defaults", [RESET_ACTION], BAD, font=16),
+        button(162, 116, 152, 46, "Reboot", [REBOOT_ACTION], GRID_BTN, font=18),
+        label(6, 168, "Tap twice within 5 s to confirm. A reboot keeps all settings.", font=14, w=308,
+              wrap_=True, align="CENTER")]
 
 
 NAV = [("\\uF015", "page_main"), ("\\uF0E7", "page_i_power"), ("\\uF011", "page_control"),
@@ -1148,10 +1155,10 @@ def render(outdir):
             text(img, bx + (bw - f.width(s)) / 2, by + (bh - f.lh) / 2, s, f, rgb(fg))
 
     for pid, ws in PAGES.items():
-        bx = 58                      # badges shown in the preview are packed like on the device
+        bx = 56                      # badges shown in the preview are packed like on the device
         for wd in ws:
             if wd["t"] == "img" and str(wd["id"]).startswith("hm_b_") and wd["preview"]:
-                wd["x"], bx = bx, bx + 23
+                wd["x"], bx = bx, bx + 22
         img = Image.new("RGB", (W, H), rgb(BG))
         d = ImageDraw.Draw(img)
         for wd in ws:

@@ -9,7 +9,8 @@ path, lvgl_path, script_path = sys.argv[1:4]
 s = open(path).read()
 a = s.index("\nlvgl:\n") + 1
 b = s.index("# -----------------------------------------------------------------------------\n# SENSORS")
-s = s[:a] + open(lvgl_path).read() + "\n" + s[b:]
+block = "# Icons for the screen (white, recoloured by LVGL): tools/make_icons.py\nimage: !include icons/images.yaml\n\n"
+s = s[:a] + open(lvgl_path).read() + "\n" + (block if "image: !include icons/images.yaml" not in s[b:] else "") + s[b:]
 for sid in ("set_ui", "show_help"):             # generated together with ui_refresh_values
     if f"  - id: {sid}\n" not in s:
         continue

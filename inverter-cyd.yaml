@@ -378,6 +378,9 @@ globals:
   - id: reset_armed
     type: uint32_t
     initial_value: '0'
+  - id: reboot_armed            # same for the Reboot button
+    type: uint32_t
+    initial_value: '0'
 
 # -----------------------------------------------------------------------------
 # USER SETTINGS (replace HA input_number helpers; editable on screen and in HA)
@@ -674,11 +677,6 @@ script:
             if (!(!id(inv_link).state || isnan(v)) && fabsf(v) < 1.0f) return std::string("-");
             return (!id(inv_link).state || isnan(v)) ? std::string("N/A") : str_sprintf("%.0f W", v);
       - lvgl.label.update:
-          id: v_sun
-          text: !lambda |-
-            float v = id(e_solar_today).state;
-            return (isnan(v)) ? std::string("N/A") : str_sprintf("%.2f kWh", v);
-      - lvgl.label.update:
           id: p_pv
           text: !lambda |-
             float v = id(s_pv_power).state;
@@ -776,10 +774,10 @@ script:
           const Badge badges[] = {{id(hm_b_observe), set.auto_ctl && set.observe}, {id(hm_b_manual), !set.auto_ctl},
                                   {id(hm_b_fault), st.fault}, {id(hm_b_low), link && (r & 1)}, {id(hm_b_high), link && (r & 2)},
                                   {id(hm_b_night), link && (r & 4)}, {id(hm_b_ovn), link && (r & 8)}, {id(hm_b_chg), link && (r & 16)}};
-          int bx = 58;
+          int bx = 56;
           for (const auto &b : badges) {
             show(b.o, b.on);
-            if (b.on) { lv_obj_set_x(b.o, bx); bx += 23; }
+            if (b.on) { lv_obj_set_x(b.o, bx); bx += 22; }
           }
           // battery in the middle: charging / discharging / idle and its power (batt_power: + = discharge)
           const float bw = id(batt_power).state;
@@ -1347,14 +1345,14 @@ lvgl:
         - image:
             id: hm_ic_pv
             x: 150
-            y: 6
+            y: 8
             src: ico_pv
             image_recolor: 0xFFB300
             image_recolor_opa: COVER
         - label:
             id: v_pv
             x: 180
-            y: 4
+            y: 6
             width: 138
             text_align: RIGHT
             styles: chip
@@ -1363,14 +1361,14 @@ lvgl:
         - image:
             id: hm_ic_load
             x: 150
-            y: 41
+            y: 52
             src: ico_load
             image_recolor: 0x29B6F6
             image_recolor_opa: COVER
         - label:
             id: v_load
             x: 180
-            y: 39
+            y: 50
             width: 138
             text_align: RIGHT
             styles: chip
@@ -1379,30 +1377,14 @@ lvgl:
         - image:
             id: hm_ic_grid
             x: 150
-            y: 76
+            y: 96
             src: ico_grid
             image_recolor: 0x43A047
             image_recolor_opa: COVER
         - label:
             id: v_grid
             x: 180
-            y: 74
-            width: 138
-            text_align: RIGHT
-            styles: chip
-            text_font: montserrat_20
-            text: "N/A"
-        - image:
-            id: hm_ic_sun
-            x: 150
-            y: 111
-            src: ico_sun
-            image_recolor: 0xFFCA28
-            image_recolor_opa: COVER
-        - label:
-            id: v_sun
-            x: 180
-            y: 109
+            y: 94
             width: 138
             text_align: RIGHT
             styles: chip
@@ -1433,7 +1415,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_observe
-            x: 58
+            x: 56
             y: 149
             src: ico_observe
             image_recolor: 0x9AA8B5
@@ -1441,7 +1423,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_manual
-            x: 81
+            x: 78
             y: 149
             src: ico_manual
             image_recolor: 0xFFB300
@@ -1449,7 +1431,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_fault
-            x: 104
+            x: 100
             y: 149
             src: ico_fault
             image_recolor: 0xE53935
@@ -1457,7 +1439,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_low
-            x: 127
+            x: 122
             y: 149
             src: ico_low
             image_recolor: 0xE53935
@@ -1465,7 +1447,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_high
-            x: 150
+            x: 144
             y: 149
             src: ico_high
             image_recolor: 0xFFB300
@@ -1473,7 +1455,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_night
-            x: 173
+            x: 166
             y: 149
             src: ico_night
             image_recolor: 0x9FA8DA
@@ -1481,7 +1463,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_ovn
-            x: 196
+            x: 188
             y: 149
             src: ico_ovn
             image_recolor: 0xFFB300
@@ -1489,7 +1471,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_b_chg
-            x: 219
+            x: 210
             y: 149
             src: ico_chg
             image_recolor: 0x29B6F6
@@ -1497,7 +1479,7 @@ lvgl:
             hidden: true
         - image:
             id: hm_empty
-            x: 244
+            x: 234
             y: 150
             src: ico_empty
             image_recolor: 0xE53935
@@ -1505,9 +1487,9 @@ lvgl:
             hidden: true
         - label:
             id: hm_empty_t
-            x: 265
+            x: 255
             y: 151
-            width: 53
+            width: 63
             text_font: montserrat_16
             text_color: 0xE53935
             text: ""
@@ -2597,7 +2579,7 @@ lvgl:
             y: 19
             text_font: montserrat_18
             text_color: 0x4FC3F7
-            text: "Restore defaults"
+            text: "Reset & reboot"
         - buttonmatrix:
             x: 240
             y: 2
@@ -2613,28 +2595,22 @@ lvgl:
                     - script.execute: { id: set_ui, what: 4, slot: 2, dir: 0 }
         - label:
             x: 6
-            y: 46
+            y: 40
             width: 308
             long_mode: WRAP
             text_font: montserrat_16
             text_color: 0xECEFF1
-            text: "Sets every rule, threshold, sound and display setting back to its default."
-        - label:
-            x: 6
-            y: 86
-            width: 308
-            long_mode: WRAP
-            text: "Keeps the touch and light-sensor calibration."
+            text: "Restore defaults: every rule, threshold, sound and display setting back to its default (touch and light calibration are kept)."
         - button:
-            x: 40
-            y: 122
-            width: 240
-            height: 48
+            x: 6
+            y: 116
+            width: 152
+            height: 46
             bg_color: 0xE53935
             widgets:
               - label:
                   align: CENTER
-                  text_font: montserrat_18
+                  text_font: montserrat_16
                   text_color: 0xFFFFFF
                   text: "Restore defaults"
             on_click:
@@ -2648,12 +2624,37 @@ lvgl:
                   else:
                     - lambda: 'id(reset_armed) = millis();'
                     - script.execute: { id: toast, msg: "Tap again within 5 s to restore defaults" }
+        - button:
+            x: 162
+            y: 116
+            width: 152
+            height: 46
+            bg_color: 0xE65100
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+                  text: "Reboot"
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(reboot_armed) != 0 && millis() - id(reboot_armed) < 5000;'
+                  then:
+                    - lambda: 'id(reboot_armed) = 0;'
+                    - script.execute: { id: toast, msg: "Rebooting..." }
+                    - delay: 1s
+                    - lambda: 'App.safe_reboot();'
+                  else:
+                    - lambda: 'id(reboot_armed) = millis();'
+                    - script.execute: { id: toast, msg: "Tap again within 5 s to reboot" }
         - label:
             x: 6
-            y: 176
+            y: 168
             width: 308
+            long_mode: WRAP
             text_align: CENTER
-            text: "Tap twice within 5 s to confirm."
+            text: "Tap twice within 5 s to confirm. A reboot keeps all settings."
     - id: page_set
       scrollable: false
       bg_color: 0x10161D
@@ -2853,7 +2854,7 @@ lvgl:
                     on_click:
                     - script.execute: { id: set_ui, what: 2, slot: 3, dir: 1 }
 
-# Icons (Material Design Icons + composed ones; tools/make_icons.py), recoloured on screen
+# Icons for the screen (white, recoloured by LVGL): tools/make_icons.py
 image: !include icons/images.yaml
 
 # -----------------------------------------------------------------------------
@@ -3037,7 +3038,7 @@ sensor:
     name: "Solar Energy"
     sensor: s_pv_power
     time_unit: h
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     device_class: energy
     state_class: total_increasing
@@ -3047,7 +3048,7 @@ sensor:
     name: "Battery Charge Energy"
     sensor: batt_charge_power
     time_unit: h
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     device_class: energy
     state_class: total_increasing
@@ -3057,7 +3058,7 @@ sensor:
     name: "Battery Discharge Energy"
     sensor: batt_discharge_power
     time_unit: h
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     device_class: energy
     state_class: total_increasing
@@ -3067,7 +3068,7 @@ sensor:
     name: "Grid Import Energy"
     sensor: grid_power
     time_unit: h
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     device_class: energy
     state_class: total_increasing
@@ -3077,7 +3078,7 @@ sensor:
     name: "Load Energy"
     sensor: s_load_power
     time_unit: h
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     device_class: energy
     state_class: total_increasing
@@ -3100,7 +3101,7 @@ sensor:
     internal: true
     power_id: s_load_power
     time_id: sntp_time
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     accuracy_decimals: 2
     filters: [multiply: 0.001]
@@ -3110,7 +3111,7 @@ sensor:
     internal: true
     power_id: grid_power
     time_id: sntp_time
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     accuracy_decimals: 2
     filters: [multiply: 0.001]
@@ -3120,7 +3121,7 @@ sensor:
     internal: true
     power_id: batt_charge_power
     time_id: sntp_time
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     accuracy_decimals: 2
     filters: [multiply: 0.001]
@@ -3130,7 +3131,7 @@ sensor:
     internal: true
     power_id: batt_discharge_power
     time_id: sntp_time
-    restore: true
+    restore: false             # no flash writes (every power update would save)
     unit_of_measurement: kWh
     accuracy_decimals: 2
     filters: [multiply: 0.001]
@@ -3154,7 +3155,7 @@ sensor:
     internal: true
     power_id: s_pv_power
     time_id: sntp_time
-    restore: true
+    restore: false
     unit_of_measurement: kWh
     accuracy_decimals: 2
     filters: [multiply: 0.001]
