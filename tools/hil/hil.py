@@ -259,7 +259,7 @@ class Board:
 # ---------------------------------------------------------------- scenarios (real time!)
 CMD = re.compile(r"(QPIGS|QPIRI|QMOD|QPIWS|QFLAG|QMN|QT|POP\d+|PCP\d+|MUCHGC\d+|PBFT[\d.]+|PBCV[\d.]+"
                  r"|PBDV[\d.]+|PSDV[\d.]+|[QPM][A-Z]+[\d.]*)$")
-WARMUP = 120                          # s of calm world before each scenario
+WARMUP = 30                           # s of calm world before each scenario
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -270,41 +270,48 @@ def at(h, m=0):
 NONE = lambda t, m: 0.0   # noqa: E731
 ALWAYS = lambda t: True   # noqa: E731
 
+# Fast profile: the controller's delays are cut to their minimum while a session runs (the owner's
+# own settings are saved first and put back afterwards), so every scenario plays in 1-3 minutes.
+FAST = {"Low SOC Delay": 5, "Min Time On Grid": 0, "High Load On Delay": 2, "High Load Off Delay": 5,
+        "Night Load On Delay": 5, "Night Load Off Delay": 10, "Night Release Delay": 5}
+KEEP = {"Battery Capacity", "PV Array Size", "PV Tilt", "PV Azimuth", "Quiet Hours From", "Quiet Hours Until",
+        "Forecast Refresh", "Buzzer", "Buzzer Quiet Hours", "Auto Control", "Observe Only"}
+
 SCENARIOS = {
     "boot_low": dict(
         desc="night 21:00, SOC 12 %, grid on: LOW -> grid (SUB), emergency grid-charge at fast current",
-        start=at(21), minutes=6, soc0=12, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
-        expect=[("write", "POP01", 0, 240), ("write", "PCP02", 0, 300), ("write", "MUCHGC020", 0, 330),
-                ("log", "tune to_grid_low", 0, 240)]),
+        start=at(21), minutes=1.5, soc0=12, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
+        expect=[("write", "POP01", 0, 60), ("write", "PCP02", 0, 90), ("write", "MUCHGC020", 0, 90),
+                ("log", "tune to_grid_low", 0, 60)]),
     "emergency_charge": dict(
-        desc="SOC 14 % at 21:00, grid on, battery x40 speed: charge to 25 % then back to solar only",
-        start=at(21), minutes=12, soc0=14, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE, speed=40,
-        expect=[("write", "PCP02", 0, 300), ("write", "PCP03", 120, 720), ("write", "MUCHGC010", 120, 720)]),
+        desc="SOC 14 % at 21:00, grid on, battery x150 speed: charge to 25 % then back to solar only",
+        start=at(21), minutes=4, soc0=14, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE, speed=150,
+        expect=[("write", "PCP02", 0, 90), ("write", "PCP03", 30, 230), ("write", "MUCHGC010", 30, 230)]),
     "high_load": dict(
-        desc="14:00 overcast, SOC 45 %: 2.8 kW for 2 min -> grid within ~15 s, back 45 s after (min 3 min)",
-        start=at(14), minutes=8, soc0=45, cloud=0.8, fc=(3, 3), grid=ALWAYS,
-        extra=lambda t, m: 2800.0 if 60 <= t < 180 else 0.0,
-        expect=[("write", "POP01", 60, 90), ("write", "POP02", 240, 300), ("nowrite", "POP02", 0, 239)]),
+        desc="14:00 overcast, SOC 45 %: 2.8 kW for 30 s -> grid within seconds, back right after",
+        start=at(14), minutes=2, soc0=45, cloud=0.8, fc=(3, 3), grid=ALWAYS,
+        extra=lambda t, m: 2800.0 if 20 <= t < 50 else 0.0,
+        expect=[("write", "POP01", 20, 45), ("write", "POP02", 55, 110), ("nowrite", "POP01", 0, 19)]),
     "grid_outage": dict(
-        desc="20:00, SOC 25 %: grid lost for 4 min -> alarm (SOC < 30 %), grid back sound after",
-        start=at(20), minutes=8, soc0=25, cloud=0.2, fc=(9, 9), grid=lambda t: not (90 <= t < 330),
+        desc="20:00, SOC 25 %: grid lost for 90 s -> alarm (SOC < 30 %), grid back sound after",
+        start=at(20), minutes=3, soc0=25, cloud=0.2, fc=(9, 9), grid=lambda t: not (20 <= t < 110),
         extra=NONE,
-        expect=[("log", "tune alarm_no_grid", 100, 200), ("log", "tune grid_back", 330, 420)]),
+        expect=[("log", "tune alarm_no_grid", 20, 110), ("log", "tune grid_back", 110, 170)]),
     "write_refused": dict(
-        desc="night, SOC 15 %: the inverter refuses POP for 3 min -> retry, fault message, recovers",
-        start=at(21), minutes=8, soc0=15, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
-        nak=lambda t, c: c.startswith("POP") and t < 180,
-        expect=[("log", "did not accept the output priority", 60, 240), ("accepted", "POP01", 180, 480)]),
+        desc="night, SOC 15 %: the inverter refuses POP -> the board retries after 30 s (the alarm after 2 tries is in the simulator)",
+        start=at(21), minutes=1.5, soc0=15, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
+        nak=lambda t, c: c.startswith("POP") and t < 100,
+        expect=[("write", "POP01", 0, 40), ("write", "POP01", 41, 90), ("nowrite", "PCP03", 0, 90)]),
     "link_loss": dict(
-        desc="night, SOC 22 %: the inverter stops answering for 3 min -> nothing written meanwhile",
-        start=at(21), minutes=7, soc0=22, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
-        silent=lambda t: 60 <= t < 240,
-        expect=[("nowrite", "", 60, 240)]),
+        desc="night, SOC 22 %: the inverter stops answering for 60 s -> nothing written meanwhile",
+        start=at(21), minutes=2, soc0=22, cloud=0.2, fc=(9, 9), grid=ALWAYS, extra=NONE,
+        silent=lambda t: 20 <= t < 80,
+        expect=[("nowrite", "", 20, 80)]),
     "soc_glitch": dict(
-        desc="11:00, SOC 60 %: the SOC reading jumps to 0 % for 30 s -> no grid, no charging",
-        start=at(11), minutes=5, soc0=60, cloud=0.3, fc=(9, 9), grid=ALWAYS, extra=NONE,
-        soc_reading=lambda s, t: 0 if 60 <= t < 90 else s,
-        expect=[("nowrite", "POP01", 0, 300), ("nowrite", "PCP02", 0, 300)]),
+        desc="11:00, SOC 60 %: the SOC reading jumps to 0 % for 3 s (shorter than the low-battery delay) -> no grid, no charging",
+        start=at(11), minutes=1.5, soc0=60, cloud=0.3, fc=(9, 9), grid=ALWAYS, extra=NONE,
+        soc_reading=lambda s, t: 0 if 20 <= t < 23 else s,
+        expect=[("nowrite", "POP01", 0, 90), ("nowrite", "PCP02", 0, 90)]),
 }
 
 
@@ -384,7 +391,7 @@ def run(board, session, name, log):
     print(f"\n== {name}: {sc['desc']}")
     epoch = local_epoch(sc["start"])
     board.logs.clear()
-    board.set_text("HIL Clock", epoch - WARMUP)
+    board.set_text("HIL Clock", local_epoch(at(12)))
     board.set_number("HIL Forecast Today", sc["fc"][0])
     board.set_number("HIL Forecast Tomorrow", sc["fc"][1])
     board.switch("Auto Control", True)
@@ -402,9 +409,10 @@ def run(board, session, name, log):
     print(f"   warm-up {WARMUP} s (calm world)...", flush=True)
     while clock() < 0:
         inv.energy = CAP_WH * 0.6
-        inv.step(clock(), 1.0, sc["start"] + clock() / 60)
+        inv.step(clock(), 1.0, at(12) + clock() / 60)
         time.sleep(1.0)
     sc.update(real)
+    board.set_text("HIL Clock", epoch)
     session.silent = sc.get("silent", lambda t: False)
     inv.energy = CAP_WH * sc["soc0"] / 100
     print("   scenario starts", flush=True)
@@ -452,6 +460,57 @@ def check(sc, inv, board):
     return fails
 
 
+SAVED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_settings.json")   # owner's values
+
+
+class Profile:
+    """The owner's settings, saved before the fast profile goes in and written back after it."""
+
+    def __init__(self, board):
+        self.board, self.old = board, {}
+
+    def apply(self, values):
+        for (domain, name) in values:     # on disk first: a killed run must not lose them
+            try:
+                self.old.setdefault((domain, name), self.board.get(domain, name))
+            except Exception:  # noqa: BLE001
+                pass
+        json.dump([[d, n, v] for (d, n), v in self.old.items()], open(SAVED, "w"))
+        for (domain, name), v in values.items():
+            try:
+                self.old.setdefault((domain, name), self.board.get(domain, name))
+                (self.board.set_number if domain == "number" else self.board.switch)(name, v)
+            except Exception as e:  # noqa: BLE001 - a missing entity must not stop the session
+                print(f"   (profile: {name}: {e})")
+
+    def restore(self):
+        for (domain, name), v in self.old.items():
+            try:
+                (self.board.set_number if domain == "number" else self.board.switch)(
+                    name, v if domain == "number" else bool(v))
+            except Exception as e:  # noqa: BLE001
+                print(f"   (restore: {name}: {e})")
+        print(f"settings restored ({len(self.old)} changed)")
+
+
+def fast_profile(board):
+    """Controller defaults except the delays, which go to FAST (see above)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "components",
+                                    "solar_autopilot"))
+    import settings_keys as k  # noqa: E402
+    want = {}
+    for _, (_, name, _u, _lo, _hi, _st, default) in k.NUMBERS.items():
+        if name not in KEEP:
+            want[("number", name)] = FAST.get(name, default)
+    for _, (_, name, default, _i) in k.SWITCHES.items():
+        if name not in KEEP:
+            want[("switch", name)] = default
+    p = Profile(board)
+    p.apply(want)
+    print(f"fast profile applied ({len(want)} settings, owner's values saved)")
+    return p
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", required=True, help="board IP (web page)")
@@ -464,6 +523,9 @@ def main():
         for k, v in SCENARIOS.items():
             print(f"{k:18} {v['minutes']:3d} min  {v['desc']}")
         return 0
+    if not os.access(args.port, os.R_OK | os.W_OK):
+        print(f"no access to {args.port}: run  sudo chmod 666 {args.port}")
+        return 2
     calm = dict(desc="idle", start=0, minutes=10 ** 6, soc0=60, cloud=0.3, fc=(9, 9), grid=ALWAYS, extra=NONE)
     session = Session(Inverter(calm))
     stop = threading.Event()
@@ -479,6 +541,7 @@ def main():
         print("the board's web page did not answer within 3 min")
         return 2
     saved = {n: board.get("switch", n) for n in ("Auto Control", "Observe Only")}
+    profile = fast_profile(board)
     names = list(SCENARIOS) if args.what == "all" else args.scenario.split(",")
     unknown = [n for n in names if n not in SCENARIOS]
     if unknown:
@@ -489,6 +552,7 @@ def main():
         for n in names:
             fails += run(board, session, n, print)
     finally:
+        profile.restore()
         for n, v in saved.items():               # the switches as they were before the session
             board.switch(n, bool(v))
         print(f"restored: {saved}")

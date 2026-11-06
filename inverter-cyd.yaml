@@ -1067,7 +1067,7 @@ script:
           text: !lambda 'return msg;'
       - lvgl.widget.show: lbl_alert
       - script.execute: bl_wake
-      - delay: 8s                  # long enough to read, short enough not to block (tap = dismiss)
+      - delay: 4s                  # long enough to read, short enough not to block (tap = dismiss)
       - lvgl.widget.hide: lbl_alert
 
   # Backlight on at the wanted level (100 %, or the auto-brightness level).
