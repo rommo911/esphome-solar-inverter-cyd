@@ -122,6 +122,7 @@ binary_sensor:
     cloudy: { name: "Cloudy Day Plan" }
     charging: { name: "Grid Charging Active" }
     fault: { name: "Controller Fault" }
+    grid: { name: "Grid Available" }               # when the component debounces the grid
 text_sensor:
   - platform: solar_autopilot
     state: { name: "Controller State" }             # e.g. "grid (SUB) LOW CHARGE"
