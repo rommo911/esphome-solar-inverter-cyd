@@ -18,6 +18,9 @@
 #ifdef USE_SOLAR_AUTOPILOT_FORECAST
 #include "esphome/components/http_request/http_request.h"
 #endif
+#ifdef USE_SOLAR_AUTOPILOT_PIPSOLAR
+#include "esphome/components/pipsolar/pipsolar.h"
+#endif
 
 #include <string>
 #include <vector>
@@ -36,11 +39,12 @@ enum OutSensor : uint8_t {
   OUT_BATTERY_REMAINING, OUT_BATTERY_RUNTIME, OUT_FORECAST_TODAY, OUT_FORECAST_TOMORROW, OUT_FORECAST_NOW,
   OUT_SENSOR_COUNT
 };
-enum OutBinary : uint8_t { OUT_LINK, OUT_CLOUDY, OUT_CHARGING, OUT_FAULT, OUT_BINARY_COUNT };
+enum OutBinary : uint8_t { OUT_LINK, OUT_CLOUDY, OUT_CHARGING, OUT_FAULT, OUT_GRID, OUT_BINARY_COUNT };
 
 class SolarAutopilot : public Component {
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
@@ -57,6 +61,13 @@ class SolarAutopilot : public Component {
   void set_float_voltage_state(sensor::Sensor *s) { float_rb_ = s; }
   void set_solar_today(sensor::Sensor *s) { solar_today_ = s; }
   void set_grid(binary_sensor::BinarySensor *b) { grid_ = b; }
+  void set_grid_voltage(sensor::Sensor *s, float min_v) {
+    grid_v_ = s;
+    grid_min_v_ = min_v;
+  }
+#ifdef USE_SOLAR_AUTOPILOT_PIPSOLAR
+  void set_pipsolar(pipsolar::Pipsolar *p) { pipsolar_ = p; }
+#endif
   void set_floating(binary_sensor::BinarySensor *b) { floating_ = b; }
   void set_forecast_today(TemplatableValue<float> v) { fc_today_ = v; }
   void set_forecast_tomorrow(TemplatableValue<float> v) { fc_tomorrow_ = v; }
@@ -82,7 +93,7 @@ class SolarAutopilot : public Component {
   void add_notify_trigger(NotifyTrigger *t) { notify_triggers_.push_back(t); }
 
   // for lambdas: id(autopilot).status().reserve_sw, id(autopilot).link() ...
-  void mark_data() { last_data_ms_ = millis(); }   // call on every inverter reply
+  void mark_data() { last_data_ms_ = millis(); }   // every inverter reply (automatic: the SOC sensor's raw values)
   uint32_t last_data_ms() const { return last_data_ms_; }
   bool link() { return autopilot_core::Controller::link(this->clock_(), this->inputs_()); }
   bool sound_allowed(bool critical) { return autopilot_core::sound_allowed(this->settings_(), this->clock_(), critical); }
@@ -97,6 +108,8 @@ class SolarAutopilot : public Component {
   autopilot_core::Settings settings_();
   void run_(const autopilot_core::Actions &acts);
   void save_();
+  void write_(select::Select *sel, const std::string &option, const char *command);
+  void grid_event_(bool state);
   void publish_(bool minute);
 #ifdef USE_SOLAR_AUTOPILOT_FORECAST
   void forecast_minute_();
@@ -118,6 +131,12 @@ class SolarAutopilot : public Component {
   sensor::Sensor *soc_ = nullptr, *load_ = nullptr, *pv_ = nullptr, *out_rb_ = nullptr, *chg_rb_ = nullptr,
                  *cur_rb_ = nullptr, *float_rb_ = nullptr, *solar_today_ = nullptr;
   binary_sensor::BinarySensor *grid_ = nullptr, *floating_ = nullptr;
+  sensor::Sensor *grid_v_ = nullptr;   // grid from its voltage, debounced here (when no grid binary sensor)
+  float grid_min_v_ = 150;
+  autopilot_core::GridDebounce grid_debounce_;
+#ifdef USE_SOLAR_AUTOPILOT_PIPSOLAR
+  pipsolar::Pipsolar *pipsolar_ = nullptr;   // writes go straight to the inverter (no selects needed)
+#endif
   TemplatableValue<float> fc_today_, fc_tomorrow_;
   select::Select *sel_out_ = nullptr, *sel_chg_ = nullptr, *sel_cur_ = nullptr, *sel_float_ = nullptr;
   number::Number *numbers_[autopilot_core::NUMBER_COUNT] = {};

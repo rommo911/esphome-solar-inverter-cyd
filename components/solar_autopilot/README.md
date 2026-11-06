@@ -76,22 +76,32 @@ external_components:
 
 solar_autopilot:
   id: autopilot
-  time_id: sntp_time
-  sun_id: sun_c
-  soc: s_soc
-  load_power: s_load_power
-  pv_power: s_pv_power
-  grid: bs_grid                      # binary sensor, debounced (delayed_on/off 30 s)
-  output_priority_state: s_output_source_priority
-  output_priority: sel_output_source_priority
-  # optional: floating, solar_today, charger_source(_state), charge_current(_state),
-  #           float_voltage(_state), forecast_today / forecast_tomorrow (lambda), alarm_soc,
-  #           alarm_repeat_soc, settings: {key: number or switch id}
+  pipsolar_id: my_inverter           # that's all for the inverter (see below)
+  forecast: { latitude: 36.15, longitude: 36.73 }    # optional, needs http_request:
+  settings: { cloudy_kwh: n_cloudy_kwh }             # optional: bind settings to number / switch entities
   on_tune:
     - logger.log: { format: "sound %s", args: [tune.c_str()] }
   on_notify:
     - logger.log: { format: "%s", args: [message.c_str()] }
 ```
+
+**`pipsolar_id`** connects the component to the inverter.
+
+- **Readings:** the component takes them from the entities you declare under `- platform: pipsolar`
+  with that id: `battery_capacity_percent`, `ac_output_active_power`, `pv_charging_power`,
+  `grid_voltage`, `output_source_priority`, `charger_source_priority`,
+  `current_max_ac_charging_current`, `battery_float_voltage`, and the binary sensor
+  `charging_to_floating_mode`. If a required one is missing, the config check names it.
+- **Writes:** sent to the inverter as PI30 commands (POP, PCP, MUCHGC, PBFT), so no selects are
+  needed.
+- **Grid:** "voltage above `grid_min_voltage` (150 V) for 30 s".
+- **Link:** every reply refreshes it, through the SOC sensor's raw values.
+
+Any key set by hand overrides this (`soc:`, `grid:`, `output_priority:` with a select, and so on),
+which also lets you use the component without pipsolar. `solar_today:` (a total_daily_energy of PV
+power) is optional; it's the fallback when there is no forecast. `time_id` and `sun_id` are found
+automatically.
+
 
 The component publishes its results as entities, so you don't need template sensors. Every key
 is optional and takes the usual options (`name`, `id`, `internal`, filters, and so on):
@@ -146,8 +156,7 @@ lambdas, for example from Home Assistant. The core's `Forecast` class (`ap_forec
 scheduling, the URLs and the reply parsing without a JSON library. On another platform you only
 do the HTTPS GET.
 
-Feed it the inverter replies with `id(autopilot).mark_data();` in a pipsolar sensor's
-`on_raw_value`. Unbound settings use their defaults. `inverter-cyd.yaml` is the complete
+Unbound settings use their defaults. `inverter-cyd.yaml` is the complete
 example.
 
 ## Changing the logic

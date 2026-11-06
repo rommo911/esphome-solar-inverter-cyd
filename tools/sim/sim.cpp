@@ -310,7 +310,12 @@ int main(int argc, char **argv) {
   sunrise_ts = sunrise0;
 #endif
   double energy = CAP_WH * sc.soc0 / 100, soc = sc.soc0, solar_today_wh = 0;
-  bool grid_raw_prev = false, float_prev = false; uint32_t grid_change_ms = 0;
+  bool float_prev = false;
+#ifdef USE_CORE
+  autopilot_core::GridDebounce grid_debounce;
+#else
+  bool grid_raw_prev = false; uint32_t grid_change_ms = 0;
+#endif
   double unmet_wh = 0, grid_wh = 0;
   emit("\"ev\":\"start\",\"scenario\":\"%s\",\"desc\":\"%s\",\"start_min\":%.0f,\"alarm\":30,\"norm_a\":%.0f",
        sc.name, sc.desc, sc.start_min, n_chg_norm_a.state);
@@ -395,6 +400,17 @@ int main(int argc, char **argv) {
     inv_link.state = L_inv_link(); inv_link.has = true;
 #endif
 
+#ifdef USE_CORE
+    // --- Grid Available: the component's GridDebounce (voltage > 150 V for 30 s), as on the device
+    {
+      bool first = false;
+      if (grid_debounce.update(!isnan(s_grid_v.state) && s_grid_v.state > 150, SIM_MS, &first)) {
+        bs_grid.has = true; bs_grid.state = grid_debounce.state();
+        emit("\"ev\":\"grid\",\"on\":%s", bs_grid.state ? "true" : "false");
+        if (!first) autopilot_sim.grid_changed(bs_grid.state);
+      }
+    }
+#else
     // --- Grid Available: template lambda + delayed_on/off 30 s, then on_press / on_release
     bool raw = L_grid_raw();
     if (raw != grid_raw_prev) { grid_raw_prev = raw; grid_change_ms = SIM_MS; }
@@ -402,15 +418,13 @@ int main(int argc, char **argv) {
       bool first = !bs_grid.has;
       bs_grid.has = true; bs_grid.state = raw;
       emit("\"ev\":\"grid\",\"on\":%s", raw ? "true" : "false");
-#ifdef USE_CORE
-      if (!first) autopilot_sim.grid_changed(raw);
-#else
       if (!first && L_grid_cond()) {
         if (raw) play_tune.execute("grid_back", 1, false);
         else L_grid_lost();
       }
-#endif
     }
+
+#endif
 
     // --- float rule (pipsolar "charging to floating" on_press)
     bool floating = energy >= CAP_WH * 0.995;

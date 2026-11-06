@@ -25,15 +25,18 @@ void SolarAutopilot::setup() {
   this->ctl_.configure(this->cfg_);
   this->ctl_.begin(millis());
 
+  if (this->soc_ != nullptr) {   // every inverter reply refreshes the link (raw = before filters)
+    this->soc_->add_on_raw_state_callback([this](float x) {
+      if (!std::isnan(x)) this->mark_data();
+    });
+  }
   if (this->grid_ != nullptr) {
     this->grid_->add_on_state_callback([this](bool state) {
       if (!this->grid_seen_) {   // first reading after boot: no sound
         this->grid_seen_ = true;
         return;
       }
-      autopilot_core::Actions a;
-      this->ctl_.grid_changed(state, this->clock_(), this->inputs_(), a);
-      this->run_(a);
+      this->grid_event_(state);
     });
   }
   if (this->floating_ != nullptr) {
@@ -75,6 +78,22 @@ void SolarAutopilot::dump_config() {
                 (int) autopilot_core::NUMBER_COUNT, s, (int) autopilot_core::SWITCH_COUNT);
 }
 
+// grid from its voltage: changes count after 30 s (like delayed_on / delayed_off)
+void SolarAutopilot::loop() {
+  if (this->grid_ != nullptr || this->grid_v_ == nullptr) return;
+  const float v = this->grid_v_->state;
+  bool first = false;
+  if (!this->grid_debounce_.update(!std::isnan(v) && v > this->grid_min_v_, millis(), &first)) return;
+  if (this->out_binaries_[OUT_GRID] != nullptr) this->out_binaries_[OUT_GRID]->publish_state(this->grid_debounce_.state());
+  if (!first) this->grid_event_(this->grid_debounce_.state());   // first reading after boot: no sound
+}
+
+void SolarAutopilot::grid_event_(bool state) {
+  autopilot_core::Actions a;
+  this->ctl_.grid_changed(state, this->clock_(), this->inputs_(), a);
+  this->run_(a);
+}
+
 autopilot_core::Clock SolarAutopilot::clock_() {
   autopilot_core::Clock c;
   c.ms = millis();
@@ -99,6 +118,9 @@ autopilot_core::Inputs SolarAutopilot::inputs_() {
   if (this->grid_ != nullptr) {
     in.grid_known = this->grid_->has_state();
     in.grid = this->grid_->state;
+  } else {
+    in.grid_known = this->grid_debounce_.known();
+    in.grid = this->grid_debounce_.state();
   }
   in.output_priority = st(this->out_rb_);
   in.charger_source = st(this->chg_rb_);
@@ -132,9 +154,6 @@ void SolarAutopilot::run_(const autopilot_core::Actions &acts) {
   using autopilot_core::ActionType;
   static const char *const OUT[] = {"Utility first (USB)", "Solar first (SUB)", "Battery first (SBU)"};
   static const char *const CHG[] = {"Utility first", "Solar first", "Solar and utility", "Solar only"};
-  auto set = [](select::Select *sel, const std::string &opt) {
-    if (sel != nullptr) sel->make_call().set_option(opt).perform();
-  };
   for (const auto &a : acts) {
     switch (a.type) {
       case ActionType::NOTIFY:
@@ -145,16 +164,16 @@ void SolarAutopilot::run_(const autopilot_core::Actions &acts) {
           t->trigger(std::string(autopilot_core::tune_name((autopilot_core::Tune) a.code)), (int) a.prio, a.critical);
         break;
       case ActionType::SET_OUTPUT_PRIORITY:
-        set(this->sel_out_, OUT[a.code % 3]);
+        this->write_(this->sel_out_, OUT[a.code % 3], str_sprintf("POP%02d", a.code % 3).c_str());
         break;
       case ActionType::SET_CHARGER_SOURCE:
-        set(this->sel_chg_, CHG[a.code % 4]);
+        this->write_(this->sel_chg_, CHG[a.code % 4], str_sprintf("PCP%02d", a.code % 4).c_str());
         break;
       case ActionType::SET_CHARGE_CURRENT:
-        set(this->sel_cur_, std::to_string((int) a.value));
+        this->write_(this->sel_cur_, std::to_string((int) a.value), str_sprintf("MUCHGC0%02.0f", a.value).c_str());
         break;
       case ActionType::SET_FLOAT_VOLTAGE:
-        set(this->sel_float_, str_sprintf("%.1f", a.value));
+        this->write_(this->sel_float_, str_sprintf("%.1f", a.value), str_sprintf("PBFT%02.1f", a.value).c_str());
         break;
       case ActionType::LOG:
         ESP_LOGW(TAG, "%s", a.text);
@@ -170,8 +189,8 @@ void SolarAutopilot::publish_(bool minute) {
   const autopilot_core::Inputs in = this->inputs_();
   const autopilot_core::Settings s = this->settings_();
   const bool link = autopilot_core::Controller::link(this->clock_(), in);
-  const bool bin[OUT_BINARY_COUNT] = {link, st.cloudy, st.charging, st.fault};
-  for (uint8_t i = 0; i < OUT_BINARY_COUNT; i++)
+  const bool bin[OUT_GRID] = {link, st.cloudy, st.charging, st.fault};   // grid: published by loop()
+  for (uint8_t i = 0; i < OUT_GRID; i++)
     if (this->out_binaries_[i] != nullptr) this->out_binaries_[i]->publish_state(bin[i]);
 #ifdef USE_TEXT_SENSOR
   if (this->state_text_ != nullptr) {
@@ -277,6 +296,21 @@ void SolarAutopilot::fetch_(autopilot_core::Forecast::Kind kind) {
   }
 }
 #endif
+
+// A select if one is configured (its set_action does the write), else the PI30 command directly.
+void SolarAutopilot::write_(select::Select *sel, const std::string &option, const char *command) {
+  if (sel != nullptr) {
+    sel->make_call().set_option(option).perform();
+    return;
+  }
+#ifdef USE_SOLAR_AUTOPILOT_PIPSOLAR
+  if (this->pipsolar_ != nullptr) {
+    this->pipsolar_->queue_command(command);
+    return;
+  }
+#endif
+  ESP_LOGE(TAG, "no way to write %s: set pipsolar_id or a select", command);
+}
 
 void SolarAutopilot::save_() {
   const autopilot_core::Persist p = this->ctl_.persist();

@@ -76,7 +76,7 @@ SIGS = {
     "float_cond": "bool L_float_cond()", "inv_link": "bool L_inv_link()",
 }
 if core:
-    SIGS = {k: v for k, v in SIGS.items() if k in ("play_tune", "grid_raw")}
+    SIGS = {k: v for k, v in SIGS.items() if k == "play_tune"}   # grid: the core's GridDebounce
 missing = set(SIGS) - set(lambdas)
 assert not missing, f"not found in YAML: {missing}"
 with open(os.path.join(out, "lambdas.inc"), "w") as f:
