@@ -259,6 +259,7 @@ This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
 |---|---|---|---|---|---|
 | Battery Capacity | 4.5 kWh | 1 to 30 | 0.1 | yes | no |
 | Battery Empty At | 5 % | 0 to 30 | 1 | yes | no |
+| Inverter Max Power | 4000 W | 500 to 10000 | 100 | yes | no |
 | PV Array Size | 2 kWp | 0.5 to 20 | 0.1 | yes | no |
 | PV Tilt | 40° | 0 to 90 | 1 | yes | no |
 | PV Azimuth | 0° | -180 to 180 | 5 | yes | no |

@@ -16,7 +16,7 @@ sys.path.insert(0, HERE)
 from cyd_settings import NUMBERS, SWITCHES  # noqa: E402
 
 OUT = os.path.join(HERE, "..", "components", "solar_autopilot")
-NOT_CORE = {"n_bl_min", "n_ldr_dark", "n_ldr_bright",
+NOT_CORE = {"n_inv_max_w", "n_bl_min", "n_ldr_dark", "n_ldr_bright",
             "sw_autobl", "sw_touchdbg"}
 
 

@@ -10,11 +10,13 @@ s = open(path).read()
 a = s.index("\nlvgl:\n") + 1
 b = s.index("# -----------------------------------------------------------------------------\n# SENSORS")
 s = s[:a] + open(lvgl_path).read() + "\n" + s[b:]
-if "  - id: set_ui\n" in s:                      # generated together with ui_refresh_values
-    a0 = s.index("  - id: set_ui\n")
+for sid in ("set_ui", "show_help"):             # generated together with ui_refresh_values
+    if f"  - id: {sid}\n" not in s:
+        continue
+    a0 = s.index(f"  - id: {sid}\n")
     while s[:a0].endswith("\n") and s[:a0].rstrip("\n").rsplit("\n", 1)[-1].lstrip().startswith("#"):
         a0 = s[:a0].rstrip("\n").rfind("\n") + 1
-    b0 = s.index("\n  - id: ", s.index("  - id: set_ui\n") + 5) + 1
+    b0 = s.index("\n  - id: ", s.index(f"  - id: {sid}\n") + 5) + 1
     s = s[:a0] + s[b0:]
 start = s.index("  - id: ui_refresh_values\n")
 b = s.index("\n  - id: ", start + 5) + 1          # end = next script

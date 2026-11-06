@@ -9,3 +9,4 @@ preview*/
 tools/sim/gen/
 tools/sim/results*/
 __pycache__/
+tools/hil/last_run*.txt

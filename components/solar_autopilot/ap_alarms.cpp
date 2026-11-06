@@ -16,14 +16,15 @@ void AlarmManager::runtime(uint32_t now, bool link, const Inputs &in, const Sett
   const bool n = rt_now_.update(!std::isnan(rt_now) && rt_now < 0.5f, now, 300000);
   if ((b || n) && (last_rt_ == 0 || now - last_rt_ >= 1800000)) {
     last_rt_ = now;
-    out.text(ActionType::NOTIFY, "No grid: battery for about %.1f h",
-             std::min(rt_base, std::isnan(rt_now) ? rt_base : rt_now));
+    // hours + minutes: no decimal point, which the screen would wrap at
+    const float h = std::min(rt_base, std::isnan(rt_now) ? rt_base : rt_now);
+    out.text(ActionType::NOTIFY, "No grid: battery lasts about %d h %02d min", (int) h, (int) ((h - (int) h) * 60));
     out.tune(Tune::ALARM_NO_GRID, 3, true);
   }
   if (morning_.update(!std::isnan(soc_at_sun) && soc_at_sun < s.ovn_floor, now, 300000) &&
       (last_mw_ == 0 || now - last_mw_ >= 1800000)) {
     last_mw_ = now;
-    out.text(ActionType::NOTIFY, "No grid: battery may run out before sunrise (%.0f %%)", soc_at_sun);
+    out.text(ActionType::NOTIFY, "No grid: battery may run out before the sun is up");
     out.tune(Tune::WARN_MORNING, 3, true);
   }
 }

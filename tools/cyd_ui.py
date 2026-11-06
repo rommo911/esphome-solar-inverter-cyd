@@ -33,6 +33,12 @@ PV_COL, LOAD_COL = 0xFFB300, 0x29B6F6   # gauge rings: battery = GOOD (green)
 RING = 14                                # ring width 10 + gap 4
 PV_MAX_W, LOAD_MAX_W = 4000, 4000        # full scale of the solar / load rings
 CHIP_PX, CHIP_PY = 7, 3   # chip padding (left/right, top/bottom)
+ALERT_FONT, ALERT_PAD, ALERT_W = 16, 6, 316   # banner: two lines across the top
+ICON_DIR = os.environ.get("CYD_ICONS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "icons"))
+# every banner message the controller can send (longest values): must fit two banner lines
+ALERTS = ["Battery low - switched to grid", "Inverter did not accept the output priority",
+          "Inverter did not accept the charger setting", "No grid: battery lasts about 23 h 59 min",
+          "No grid: battery may run out before the sun is up"]
 
 
 # ------------------------------------------------------------------ font metrics
@@ -115,6 +121,14 @@ def chip(x, y, w, id, sample, font=18, align="RIGHT", text="N/A", dots=False):
                  chip=True, dots=dots)
 
 
+def img(x, y, w, h, id, src, color, hidden=False, preview=True, click=None, alt=None):
+    """Icon (white SVG from icons/, recoloured). hidden: starts hidden (shown by the refresh lambda);
+    preview: drawn in the PNG previews; click: actions on tap; alt: group of alternatives that share
+    one spot (only one is shown at a time, so they may overlap)."""
+    return dict(t="img", x=x, y=y, w=w, h=h, id=id, src=src, color=color, hidden=hidden, preview=preview,
+                click=click, alt=alt)
+
+
 def bm(x, y, w, h, buttons, font=16, id=None, item_bg=None, item_txt=None):
     return dict(t="bm", x=x, y=y, w=w, h=h, buttons=buttons, font=font, id=id,
                 item_bg=item_bg, item_txt=item_txt)
@@ -136,11 +150,20 @@ def sw_cell(x, y, cw, ch, text, lvid, sw, font=16):
 
 # setting name / value format (value goes in the chip): from cyd_settings.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cyd_settings import NUMBERS, VPAGES  # noqa: E402
+from cyd_settings import HELP, NUMBERS, VPAGES  # noqa: E402
 FMT = {n[0]: (n[7], n[8]) for n in NUMBERS if n[7]}
 MAXV = {n[0]: n[4] for n in NUMBERS}
 
-NAME_W = 146                        # name column
+INFO_X, NAME_X, NAME_W = 4, 24, 128   # (i) icon, name column
+DEF = {n[0]: n[8] % n[6] for n in NUMBERS if n[8]}
+
+
+def help_text(nid):
+    return HELP[nid] + " Default " + DEF[nid].replace("%%", "%") + "."
+
+
+def help_action(nid):
+    return f"script.execute: {{ id: show_help, msg: {cstr(help_text(nid))} }}"
 CHIP_X, CHIP_W = 156, 86            # value chip
 BTN_X, BTN_W = 246, 72              # - / + buttons
 
@@ -173,14 +196,16 @@ def num_rows(nids, y0=42, y1=NAV_Y - 2, rec=None):
         nl = len(wrap(name, FONTS[f], NAME_W))
         th = nl * FONTS[f].lh
         ch = FONTS[vfont].lh + 2 * CHIP_PY
-        out.append(label(6, y + (pitch - th) // 2, name, font=f, w=NAME_W, wrap_=True))
+        iy = y + (pitch - 16) // 2
+        out.append(img(INFO_X, iy, 16, 16, "inf_" + nid, "ico_info", TITLE, click=[help_action(nid)]))
+        out.append(label(NAME_X, y + (pitch - th) // 2, name, font=f, w=NAME_W, wrap_=True))
         out.append(chip(CHIP_X, y + (pitch - ch) // 2, CHIP_W, "lb_" + nid,
                         vf % MAXV.get(nid, 60), font=vfont, align="CENTER", text="--"))
         out.append(bm(BTN_X, y + (pitch - bh) // 2, BTN_W, bh, [
             ("\\uF068", [f"number.decrement: {{ id: {nid}, cycle: false }}"]),
             ("\\uF067", [f"number.increment: {{ id: {nid}, cycle: false }}"])], font=16))
         if rec is not None:
-            rec.append(dict(nid=nid, name=name, fmt=vf, ny=y + (pitch - th) // 2, nf=f,
+            rec.append(dict(nid=nid, name=name, fmt=vf, ny=y + (pitch - th) // 2, nf=f, iy=iy, help=help_text(nid),
                             cy=y + (pitch - ch) // 2, cf=vfont, by=y + (pitch - bh) // 2, bh=bh))
     return out
 
@@ -231,8 +256,8 @@ GUARD = ("if:\n  condition: {{ binary_sensor.is_on: inv_link }}\n  then:\n"
 LIVE = {
     "v_load": ("id(s_load_power).state", "%.0f W", True),
     "v_pv": ("id(s_pv_power).state", "%.0f W", True),
-    "v_batt": ("id(s_soc).state", "%.0f %%", True),
     "v_grid": ("id(grid_power).state", "%.0f W", True),
+    "v_sun": ("id(e_solar_today).state", "%.2f kWh", False),
     "p_pv": ("id(s_pv_power).state", "%.0f W", True),
     "p_load": ("id(s_load_power).state", "%.0f W", True),
     "p_batt": ("id(batt_power).state", "%+.0f W", True),
@@ -249,6 +274,65 @@ LIVE = {
     "e_chg": ("id(e_chg_today).state", "%.2f kWh", False),
     "e_dis": ("id(e_dis_today).state", "%.2f kWh", False),
 }
+DASH0 = {"v_pv", "v_grid"}
+# Home: icons and badges (C++, runs every 2 s in ui_refresh_values)
+HOME_LAMBDA = r"""
+auto show = [](lv_obj_t *o, bool v) { if (v) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN); };
+auto tint = [](lv_obj_t *o, uint32_t c) { lv_obj_set_style_image_recolor(o, lv_color_hex(c), LV_PART_MAIN); };
+const bool link = id(inv_link).state;
+const auto st = id(autopilot).status();
+const auto set = id(autopilot).settings();
+const uint8_t r = st.reasons;
+// where the house gets its power (read back from the inverter)
+const bool sub = link && id(s_output_source_priority).state == 1.0f;
+show(id(hm_path_batt), link && !sub);
+show(id(hm_path_grid), sub && !st.charging);
+show(id(hm_path_chg), sub && st.charging);
+// badges, packed from the left
+struct Badge { lv_obj_t *o; bool on; };
+const Badge badges[] = {{id(hm_b_observe), set.auto_ctl && set.observe}, {id(hm_b_manual), !set.auto_ctl},
+                        {id(hm_b_fault), st.fault}, {id(hm_b_low), link && (r & 1)}, {id(hm_b_high), link && (r & 2)},
+                        {id(hm_b_night), link && (r & 4)}, {id(hm_b_ovn), link && (r & 8)}, {id(hm_b_chg), link && (r & 16)}};
+int bx = 58;
+for (const auto &b : badges) {
+  show(b.o, b.on);
+  if (b.on) { lv_obj_set_x(b.o, bx); bx += 23; }
+}
+// battery in the middle: charging / discharging / idle and its power (batt_power: + = discharge)
+const float bw = id(batt_power).state;
+const bool known = link && !isnan(bw);
+show(id(hm_bat_plus), known && bw < -15);
+show(id(hm_bat_minus), known && bw > 15);
+show(id(hm_bat_idle), !known || fabsf(bw) <= 15);
+lv_label_set_text(id(hm_bat_w), !known ? "" : str_sprintf("%+.0f W", -bw).c_str());
+lv_obj_set_style_text_color(id(hm_bat_w), lv_color_hex(bw < -15 ? 0x43A047 : 0xFFB300), LV_PART_MAIN);
+// grid: green present, red lost, grey unknown
+tint(id(hm_ic_grid), !link || !id(bs_grid).has_state() ? 0x546E7A : id(bs_grid).state ? 0x43A047 : 0xE53935);
+// battery runs out before the sun is useful: red empty battery + estimated hour ("~4am")
+auto t = id(sntp_time).now();
+const float soc = id(s_soc).state;
+const bool empty = link && t.is_valid() && !isnan(st.soc_at_sun) && st.soc_at_sun < set.empty_soc && !isnan(soc) &&
+                   st.base_load > 0;
+show(id(hm_empty), empty);
+show(id(hm_empty_t), empty);
+if (empty) {
+  const float hours = std::max(0.0f, set.batt_kwh * 1000.0f * (soc - set.empty_soc) / 100.0f / st.base_load);
+  auto e = ESPTime::from_epoch_local(t.timestamp + (time_t) (hours * 3600.0f) + 1800);   // rounded to the hour
+  const int h12 = e.hour % 12 == 0 ? 12 : e.hour % 12;
+  lv_label_set_text(id(hm_empty_t), str_sprintf("~%d%s", h12, e.hour < 12 ? "am" : "pm").c_str());
+}
+// clock and status icons: inverter link, Home Assistant, internet
+lv_label_set_text(id(lbl_clock), t.is_valid() ? t.strftime("%H:%M").c_str() : "--:--");
+tint(id(ic_inv), link ? 0x43A047 : 0xE53935);
+#ifdef USE_API
+tint(id(ic_ha), api::global_api_server->is_connected() ? 0x43A047 : 0xE53935);
+#else
+tint(id(ic_ha), 0x37474F);   // API not compiled in
+#endif
+const uint32_t fc = id(autopilot).forecast().last_reply_ms();
+const bool inet = (id(net_ok_ms) != 0 && millis() - id(net_ok_ms) < 11UL * 60000UL) || (fc != 0 && millis() - fc < 11UL * 60000UL);
+tint(id(ic_wifi), !wifi::global_wifi_component->is_connected() ? 0xE53935 : inet ? 0x43A047 : 0xFDD835);
+"""
 _RT = ('float soc = id(s_soc).state, load = {load};\n'
        'if (!id(inv_link).state || isnan(soc) || isnan(load)) return std::string("N/A");\n'
        'float wh = std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state));\n'
@@ -289,33 +373,52 @@ RESET_ACTION = ("if:\n  condition:\n"
                 "    - script.execute: { id: toast, msg: \"Tap again within 5 s to restore defaults\" }")
 
 PAGES = {}
+# reason / mode badges on Home, in display order: (icon key, colour)
+BADGES = [("observe", 0x9AA8B5), ("manual", 0xFFB300), ("fault", 0xE53935), ("low", 0xE53935),
+          ("high", 0xFFB300), ("night", 0x9FA8DA), ("ovn", 0xFFB300), ("chg", 0x29B6F6)]
 
 
 def build():
     lh18, lh20 = FONTS[18].lh, FONTS[20].lh
     ch20 = lh20 + 2 * CHIP_PY
     # ---------------- Home
-    # three concentric gauges: outer = battery %, middle = solar, inner = load
+    # three concentric gauges: outer = battery %, middle = solar, inner = load (% of inverter max)
     p = [dict(t="arc", id="arc_soc", x=2, y=2, w=140, h=140, color=GOOD, max=100),
          dict(t="arc", id="arc_pv", x=2 + RING, y=2 + RING, w=140 - 2 * RING, h=140 - 2 * RING,
               color=PV_COL, max=100),
          dict(t="arc", id="arc_load", x=2 + 2 * RING, y=2 + 2 * RING, w=140 - 4 * RING,
-              h=140 - 4 * RING, color=LOAD_COL, max=LOAD_MAX_W),
-         label(2, 2 + 70 - FONTS[20].lh // 2, "N/A", font=20, w=140, id="lbl_soc",
-               sample="100%", align="CENTER", color=0xFFFFFF)]
-    for i, (nm, vid, smp, col) in enumerate([("Batt", "v_batt", "+12345 W", GOOD),
-                                             ("PV", "v_pv", "12345 W", PV_COL),
-                                             ("Load", "v_load", "12345 W", LOAD_COL),
-                                             ("Grid", "v_grid", "12345 W", NAME)]):
+              h=140 - 4 * RING, color=LOAD_COL, max=100)]
+    # middle of the gauges: battery charging (+) / discharging (-) / idle, SOC, battery power
+    cy = 2 + 70
+    soc_y = cy - lh20 // 2 + 4
+    p += [img(59, soc_y - 27, 26, 26, f"hm_bat_{k}", f"ico_batt_{k}", c, hidden=k != "plus", preview=k == "plus",
+              alt="bat")
+          for k, c in (("plus", GOOD), ("minus", PV_COL), ("idle", NAME))]
+    p += [label(2 + RING * 2 + 10, soc_y, "N/A", font=20, w=140 - 4 * RING - 20, id="lbl_soc", sample="100%",
+                align="CENTER", color=0xFFFFFF),
+          # below the rings' inner ends (they are open at the bottom)
+          label(42, 104, "", font=14, w=60, id="hm_bat_w", sample="+1234 W", align="CENTER", color=GOOD)]
+    # right column: icon + value (zero = dimmed dash)
+    for i, (ico, iid, vid, smp, col) in enumerate([("ico_pv", "hm_ic_pv", "v_pv", "12345 W", PV_COL),
+                                                  ("ico_load", "hm_ic_load", "v_load", "12345 W", LOAD_COL),
+                                                  ("ico_grid", "hm_ic_grid", "v_grid", "12345 W", GOOD),
+                                                  ("ico_sun", "hm_ic_sun", "v_sun", "99.99 kWh", VAL)]):
         y = 4 + i * 35
-        p += [label(150, y + (ch20 - lh18) // 2, nm, font=18, color=col),
-              chip(202, y, 116, vid, smp, font=20)]
-    p += [label(6, 146, "?", font=18, w=308, id="lbl_mode", dots=True, color=TITLE,
-                sample="OBSERVE: SUB LOW HIGH NIGHT OVN CHG"),
-          label(6, 175, "", font=16, id="lbl_status", sample="23:59  37/40%  sun 100%", color=NAME),
-          label(212, 175, "INV", font=16, id="ic_inv", color=BAD),
-          label(250, 175, "HA", font=16, id="ic_ha", color=BAD),
-          label(292, 175, "\\uF1EB", font=16, id="ic_wifi", color=BAD, sample="")]
+        p += [img(150, y + (ch20 - 24) // 2, 24, 24, iid, ico, col),
+              chip(180, y, 138, vid, smp, font=20)]
+    # status row: power path + reason badges (packed left by the refresh lambda) + "battery empty ~4am"
+    p += [img(4, 148, 50, 23, f"hm_path_{k}", f"ico_path_{k}", c, hidden=k != "batt", preview=k == "batt",
+              alt="path")
+          for k, c in (("batt", GOOD), ("grid", GRID_BTN), ("chg", 0x29B6F6))]
+    for i, (k, c) in enumerate(BADGES):
+        p.append(img(58 + i * 23, 149, 22, 22, f"hm_b_{k}", f"ico_{k}", c, hidden=True, preview=k in ("low", "chg")))
+    p += [img(244, 150, 20, 20, "hm_empty", "ico_empty", BAD, hidden=True),
+          label(265, 151, "", font=16, w=53, id="hm_empty_t", sample="~12am", color=BAD)]
+    # bottom row: clock | inverter, Home Assistant, WiFi
+    p += [label(6, 177, "", font=16, id="lbl_clock", sample="23:59", color=NAME),
+          img(252, 178, 18, 18, "ic_inv", "ico_inverter", BAD),
+          img(276, 178, 18, 18, "ic_ha", "ico_ha", BAD),
+          img(300, 178, 18, 18, "ic_wifi", "ico_wifi", BAD)]
     PAGES["page_main"] = p
 
     # ---------------- Info 1/4: live power, 2 columns x 5 rows of  name [value]
@@ -447,6 +550,11 @@ BM_PAD, BM_GAP = 2, 4
 
 def check():
     probs = []
+    f = FONTS[ALERT_FONT]
+    for m in ALERTS:
+        lines = wrap(m, f, ALERT_W - 2 * ALERT_PAD)
+        if len(lines) > 2:
+            probs.append(f"banner: '{m}' needs {len(lines)} lines")
     for pid, ws in PAGES.items():
         boxes = []
         for wd in ws:
@@ -471,11 +579,13 @@ def check():
                         probs.append(f"{pid}: button '{t}' {tw:.0f}px > {bw - 8:.0f}")
                 if f.lh > wd["h"] - 2 * BM_PAD - 4:
                     probs.append(f"{pid}: button too low for font")
-            boxes.append((name, x, y, w, h))
+            boxes.append((name, x, y, w, h, wd.get("alt")))
         for i in range(len(boxes)):
             for j in range(i + 1, len(boxes)):
                 a, b = boxes[i], boxes[j]
                 if str(a[0]).startswith("arc_") or str(b[0]).startswith("arc_"):
+                    continue
+                if a[5] is not None and a[5] == b[5]:      # alternatives on one spot
                     continue
                 if a[1] < b[1] + b[3] and b[1] < a[1] + a[3] and a[2] < b[2] + b[4] and b[2] < a[2] + a[4]:
                     probs.append(f"{pid}: OVERLAP {a[0]} {tuple(round(v) for v in a[1:5])} "
@@ -589,6 +699,21 @@ def emit():
 {q}indicator:
 {q}  arc_color: {hx(wd['color'])}
 {q}  arc_width: 10""")
+        elif t == "img":
+            w(f"{p}- image:")
+            w(f"{q}id: {wd['id']}")
+            w(f"{q}x: {wd['x']}")
+            w(f"{q}y: {wd['y']}")
+            w(f"{q}src: {wd['src']}")
+            w(f"{q}image_recolor: {hx(wd['color'])}")
+            w(f"{q}image_recolor_opa: COVER")
+            if wd["hidden"]:
+                w(f"{q}hidden: true")
+            if wd["click"]:
+                w(f"{q}clickable: true")
+                w(f"{q}ext_click_area: 10")
+                w(f"{q}on_click:")
+                actions(wd["click"], ind + 6)
         elif t == "dropdown":
             w(f"""{p}- dropdown:
 {q}id: {wd['id']}
@@ -668,13 +793,10 @@ def emit():
       pad_top: {CHIP_PY}
       pad_bottom: {CHIP_PY}
       text_color: {hx(VAL)}
-  on_idle:
+  on_idle:                       # dim after 90 s untouched; the screen never goes off
     - timeout: 90s
       then:
         - light.turn_on: {{ id: backlight, brightness: 15% }}
-    - timeout: 10min
-      then:
-        - light.turn_off: backlight
   # Shown over every page: nav bar, alarm banner, short messages, touch-debug dot.
   top_layer:
     widgets:
@@ -691,21 +813,23 @@ def emit():
           scrollable: false""")
     widget(bm(0, NAV_Y, W, H - NAV_Y, [(s, [goto(pg)]) for s, pg in NAV],
               font=20, id="nav", item_bg=NAV_BTN, item_txt=NAV_TXT), 6)
+    ALERT_H = 2 * FONTS[ALERT_FONT].lh + 2 * ALERT_PAD
     w(f"""      - label:
           id: lbl_alert
           hidden: true
           clickable: true
-          align: CENTER
-          y: -20
-          width: 280
+          align: TOP_MID
+          y: 2
+          width: {ALERT_W}
+          height: {ALERT_H}
           long_mode: WRAP
           text_align: CENTER
-          text_font: montserrat_18
+          text_font: montserrat_{ALERT_FONT}
           bg_color: 0xC62828
           bg_opa: COVER
           text_color: 0xFFFFFF
-          radius: 10
-          pad_all: 12
+          radius: 8
+          pad_all: {ALERT_PAD}
           text: ""
           on_click:                    # tap = silence and dismiss
             - rtttl.stop: {{ id: buzzer }}
@@ -726,6 +850,25 @@ def emit():
           pad_all: 8
           radius: 8
           text: ""
+      - label:
+          id: lbl_help
+          hidden: true
+          clickable: true
+          align: CENTER
+          y: -10
+          width: 300
+          long_mode: WRAP
+          text_font: montserrat_14
+          bg_color: 0x1C2833
+          bg_opa: COVER
+          border_color: 0x4FC3F7
+          border_width: 1
+          text_color: 0xECEFF1
+          pad_all: 10
+          radius: 8
+          text: ""
+          on_click:                    # tap = close
+            - lvgl.widget.hide: lbl_help
       - obj:
           id: touch_dot
           hidden: true
@@ -761,7 +904,9 @@ def set_page_widgets():
                               ("\\uF054", [SET_ACT.format(what=3, slot=0, dir=1)])])]
     for i in range(4):
         y = 42 + i * 39
-        ws += [label(6, y, "", font=16, w=NAME_W, id=f"set_n{i}", wrap_=True, sample="-"),
+        ws += [img(INFO_X, y + 10, 16, 16, f"set_i{i}", "ico_info", TITLE,
+                   click=[SET_ACT.format(what=5, slot=i, dir=0)]),
+               label(NAME_X, y, "", font=16, w=NAME_W, id=f"set_n{i}", wrap_=True, sample="-"),
                chip(CHIP_X, y, CHIP_W, f"set_v{i}", "-", font=18, align="CENTER", text="--"),
                bm(BTN_X, y, BTN_W, 35, [("\\uF068", [SET_ACT.format(what=2, slot=i, dir=-1)]),
                                         ("\\uF067", [SET_ACT.format(what=2, slot=i, dir=1)])], font=16,
@@ -775,15 +920,16 @@ def cstr(t):
 
 def emit_set_script():
     """set_ui(what, slot, dir): 0 show current, 1 refresh values, 2 step slot by dir,
-    3 page by dir (may leave to a real page), 4 open virtual page `slot`."""
+    3 page by dir (may leave to a real page), 4 open virtual page `slot`, 5 help for row `slot`."""
     groups = {"SETUP": SETUP, "ADVANCED": ADV}
     rows_c = []
     for k, (pid, grp, title, _) in enumerate(VPAGES):
         g = groups[grp]
         rr = []
         for r in ROWREC[pid]:
-            rr.append(f"{{id({r['nid']}), {cstr(r['name'])}, {cstr(r['fmt'])}, {r['ny']}, {r['cy']}, {r['by']}, "
-                      f"{r['bh']}, &lv_font_montserrat_{r['nf']}, &lv_font_montserrat_{r['cf']}}}")
+            rr.append(f"{{id({r['nid']}), {cstr(r['name'])}, {cstr(r['fmt'])}, {cstr(r['help'])}, {r['ny']}, "
+                      f"{r['cy']}, {r['by']}, {r['bh']}, {r['iy']}, &lv_font_montserrat_{r['nf']}, "
+                      f"&lv_font_montserrat_{r['cf']}}}")
         rows_c.append(f"            {{{cstr(f'{grp} {g.index(pid) + 1}/{len(g)}')}, {cstr(title)}, {len(rr)}, {{{', '.join(rr)}}}}}")
 
     def seq(g):
@@ -802,7 +948,7 @@ def emit_set_script():
       dir: int
     then:
       - lambda: |-
-          struct Row {{ number::Number *n; const char *name, *fmt; int16_t ny, cy, by, bh; const lv_font_t *nf, *cf; }};
+          struct Row {{ number::Number *n; const char *name, *fmt, *help; int16_t ny, cy, by, bh, iy; const lv_font_t *nf, *cf; }};
           struct Pg {{ const char *grp, *title; uint8_t nrows; Row r[4]; }};
           static const Pg P[] = {{
 {(','+chr(10)).join(rows_c)}
@@ -812,8 +958,13 @@ def emit_set_script():
           lv_obj_t *const N[4] = {{set_n0, set_n1, set_n2, set_n3}};
           lv_obj_t *const V[4] = {{set_v0, set_v1, set_v2, set_v3}};
           lv_obj_t *const B[4] = {{set_b0->obj, set_b1->obj, set_b2->obj, set_b3->obj}};
+          lv_obj_t *const I[4] = {{set_i0, set_i1, set_i2, set_i3}};
           id(set_goto) = 0;
           int k = id(set_idx), w = what;
+          if (w == 5) {{
+            if (slot < P[k].nrows) id(show_help).execute(std::string(P[k].r[slot].help));
+            return;
+          }}
           if (w == 4) {{ k = slot; w = 0; id(set_goto) = 1; }}
           else if (w == 3) {{
             const bool setup = k < {n_setup_v};
@@ -841,12 +992,13 @@ def emit_set_script():
             for (int i = 0; i < 4; i++) {{
               if (i >= p.nrows) {{
                 lv_obj_add_flag(N[i], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(V[i], LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(B[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(B[i], LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(I[i], LV_OBJ_FLAG_HIDDEN);
                 continue;
               }}
               const Row &r = p.r[i];
               lv_obj_remove_flag(N[i], LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(V[i], LV_OBJ_FLAG_HIDDEN);
-              lv_obj_remove_flag(B[i], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_remove_flag(B[i], LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(I[i], LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_y(I[i], r.iy);
               lv_label_set_text(N[i], r.name);
               lv_obj_set_style_text_font(N[i], r.nf, LV_PART_MAIN);
               lv_obj_set_y(N[i], r.ny);
@@ -869,6 +1021,17 @@ def emit_set_script():
             lambda: 'return id(set_goto) == {code};'
           then: [ lvgl.page.show: {pid} ]
 """
+    lines += """  # Setting help (the (i) on a row): over any page, tap or 12 s to close.
+  - id: show_help
+    mode: restart
+    parameters:
+      msg: string
+    then:
+      - lvgl.label.update: { id: lbl_help, text: !lambda 'return msg;' }
+      - lvgl.widget.show: lbl_help
+      - delay: 12s
+      - lvgl.widget.hide: lbl_help
+"""
     return lines
 
 
@@ -886,13 +1049,16 @@ def emit_ui_script():
         o += ["      - lvgl.label.update:",
               f"          id: {vid}",
               "          text: !lambda |-",
-              f"            float v = {expr};",
-              f'            return ({cond}) ? std::string("N/A") : str_sprintf("{fmt}", v);']
+              f"            float v = {expr};"]
+        if vid in DASH0:      # Home: nothing flowing = a dash, not "0 W"
+            o += ["            if (!(" + cond + ") && fabsf(v) < 1.0f) return std::string(\"-\");"]
+        o += [f'            return ({cond}) ? std::string("N/A") : str_sprintf("{fmt}", v);']
     for aid, expr in (("arc_pv", "id(s_pv_power).state / std::max(0.1f, id(n_pv_kwp).state) / 10.0f"),
-                      ("arc_load", "id(s_load_power).state")):
+                      ("arc_load", "id(s_load_power).state / std::max(100.0f, id(n_inv_max_w).state) * 100.0f")):
         o += ["      - lvgl.arc.update:",
               f"          id: {aid}",
               f"          value: !lambda 'float v = {expr}; return (!id(inv_link).state || isnan(v)) ? 0 : (int) v;'"]
+    o += ["      - lambda: |-"] + ["          " + l for l in HOME_LAMBDA.strip("\n").split("\n")]
     o += ["      - lvgl.label.update:",
           "          id: lbl_age",
           "          text: !lambda |-",
@@ -958,6 +1124,18 @@ def render(outdir):
                 x + px_ + inner - lw if wd["align"] == "RIGHT" else x + px_ + (inner - lw) / 2)
             text(img, lx, y + py_ + i * (f.lh + wd["ls"]), l, f, rgb(wd["color"]))
 
+    srcs = dict(re.findall(r"- id: (\S+)\n  file: icons/(\S+)\.svg", open(os.path.join(ICON_DIR, "images.yaml")).read()))
+
+    def icon(img, wd):
+        import io
+        import resvg_py
+        png = bytes(resvg_py.svg_to_bytes(svg_path=os.path.join(ICON_DIR, srcs[wd["src"]] + ".svg"),
+                                          width=wd["w"], height=wd["h"]))
+        ic = Image.open(io.BytesIO(png)).convert("RGBA")
+        solid = Image.new("RGBA", ic.size, rgb(wd["color"]) + (255,))
+        solid.putalpha(ic.getchannel("A"))
+        img.paste(solid, (wd["x"], wd["y"]), solid)
+
     def buttons(img, d, wd, bg=BTN, fg=BTN_TXT):
         n = len(wd["buttons"])
         bw = (wd["w"] - 2 * BM_PAD - (n - 1) * BM_GAP) / n
@@ -970,6 +1148,10 @@ def render(outdir):
             text(img, bx + (bw - f.width(s)) / 2, by + (bh - f.lh) / 2, s, f, rgb(fg))
 
     for pid, ws in PAGES.items():
+        bx = 58                      # badges shown in the preview are packed like on the device
+        for wd in ws:
+            if wd["t"] == "img" and str(wd["id"]).startswith("hm_b_") and wd["preview"]:
+                wd["x"], bx = bx, bx + 23
         img = Image.new("RGB", (W, H), rgb(BG))
         d = ImageDraw.Draw(img)
         for wd in ws:
@@ -993,6 +1175,9 @@ def render(outdir):
                 d.arc(bb, 135, 405, fill=rgb(BTN), width=10)
                 frac = {"arc_soc": 0.78, "arc_pv": 0.45, "arc_load": 0.2}[wd["id"]]
                 d.arc(bb, 135, 135 + 270 * frac, fill=rgb(wd["color"]), width=10)
+            elif t == "img":
+                if wd["preview"]:
+                    icon(img, wd)
             elif t == "dropdown":
                 d.rounded_rectangle([wd["x"], wd["y"], wd["x"] + wd["w"], wd["y"] + wd["h"]], 6,
                                     fill=rgb(CHIP_BG), outline=rgb(CHIP_BORDER), width=1)
