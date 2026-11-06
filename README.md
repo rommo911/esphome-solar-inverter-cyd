@@ -180,7 +180,7 @@ Without fresh inverter data every inverter value shows **N/A** and the inverter 
 - **Touch calibration:** press **BOOT** to try the next of 8 orientations; the red touch dot
   (Setup → Display) shows where a touch lands.
 - **Restore defaults** (Advanced, last page, tap twice within 5 s): every setting and switch back to
-  its default; keeps the touch, light-sensor and LED calibration.
+  its default; keeps the touch and light-sensor calibration.
 
 ## Settings
 
@@ -270,7 +270,7 @@ This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
 | Quiet Hours From | 1 h | 0 to 23 | 1 | yes | no |
 | Quiet Hours Until | 9 h | 0 to 23 | 1 | yes | no |
 
-**Display and LED (calibration)**
+**Display (calibration)**
 
 | Setting (HA name) | Default | Range | Step | On screen | Kept by Restore defaults |
 |---|---|---|---|---|---|

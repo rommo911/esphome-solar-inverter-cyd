@@ -20,7 +20,7 @@ GROUPS = [
     ("Night-load rule", "n_night_on_w"),
     ("Battery and solar array", "n_batt_kwh"),
     ("Sound", "n_quiet_start"),
-    ("Display and LED (calibration)", "n_bl_min"),
+    ("Display (calibration)", "n_bl_min"),
 ]
 
 
