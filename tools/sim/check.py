@@ -5,6 +5,7 @@
 import glob
 import json
 import os
+import re
 import sys
 
 QUIET = (1, 9)
@@ -132,6 +133,9 @@ def check(ev):
         ok("30 s 0 % glitch: no grid switch, no emergency charge", not sub_w and not any(s["charging"] for s in samples))
     if name == "link_loss":
         ok("nothing written during the 3 h link loss", not [w for w in allw if 120 * 60 <= w["t"] < 300 * 60])
+        gt = [t for t in tunes if t["name"] in ("gridlost", "gridback") and 120 * 60 <= t["t"] < 300 * 60 + 60]
+        ok("link loss is not reported as a grid loss (no grid sounds)", not gt,
+           ", ".join(f"{t['name']} {clock(t['t'])}" for t in gt))
     if name == "no_clock":
         ok("no clock: NIGHT and OVERNIGHT stay off", not reasons(4) and not reasons(8))
         ok("no clock: battery still protected (LOW or grid-charge)", reasons(1) or reasons(16))
@@ -161,7 +165,8 @@ def check(ev):
 def main():
     total = fails = 0
     for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.jsonl"))):
-        ev = [json.loads(l) for l in open(path) if l.startswith("{")]
+        # printf writes nan for unknown readings (link lost): JSON NaN
+        ev = [json.loads(re.sub(r":(-?)nan\b", r":\1NaN", l)) for l in open(path) if l.startswith("{")]
         name, desc, res, end, nw, nc = check(ev)
         print(f"\n== {name}: {desc}")
         print(f"   end SOC {end['soc']:.0f} %, grid {end['grid_wh'] / 1000:.2f} kWh, blackout {end['unmet_wh']:.0f} Wh, "

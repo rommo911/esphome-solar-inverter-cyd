@@ -97,6 +97,9 @@ void SolarAutopilot::dump_config() {
 void SolarAutopilot::loop() {
   if (this->grid_ != nullptr || this->grid_v_ == nullptr) return;
   const float v = this->grid_v_->state;
+  // unknown = no reply from the inverter (pipsolar publishes NAN on a failed poll): that is a link
+  // problem, not a grid loss; keep the last grid state. A real outage reads 0 V.
+  if (std::isnan(v)) return;
   bool first = false;
   if (!this->grid_debounce_.update(!std::isnan(v) && v > this->grid_min_v_, millis(), &first)) return;
   if (this->out_binaries_[OUT_GRID] != nullptr) this->out_binaries_[OUT_GRID]->publish_state(this->grid_debounce_.state());

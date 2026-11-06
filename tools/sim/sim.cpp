@@ -377,6 +377,10 @@ int main(int argc, char **argv) {
     }
 
     // --- inverter readings every 2 s (pipsolar). on_raw_value refreshes the data watchdog.
+    if (!LINK_UP && SIM_MS % 2000 == 0) {   // pipsolar: a poll that times out publishes "unknown"
+      s_soc.state = s_load_power.state = s_pv_power.state = s_grid_v.state = NAN;
+      s_output_source_priority.state = s_charger_source_priority.state = s_max_ac_charging_current.state = NAN;
+    }
     if (LINK_UP && SIM_MS % 2000 == 0) {
       s_soc.state = (float) std::round(sc.soc_reading(soc, sm));
       s_load_power.state = (float) load;
@@ -405,7 +409,7 @@ int main(int argc, char **argv) {
     // --- Grid Available: the component's GridDebounce (voltage > 150 V for 30 s), as on the device
     {
       bool first = false;
-      if (grid_debounce.update(!isnan(s_grid_v.state) && s_grid_v.state > 150, SIM_MS, &first)) {
+      if (!isnan(s_grid_v.state) && grid_debounce.update(s_grid_v.state > 150, SIM_MS, &first)) {
         bs_grid.has = true; bs_grid.state = grid_debounce.state();
         emit("\"ev\":\"grid\",\"on\":%s", bs_grid.state ? "true" : "false");
         if (!first) autopilot_sim.grid_changed(bs_grid.state);

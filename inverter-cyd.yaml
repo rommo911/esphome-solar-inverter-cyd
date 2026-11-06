@@ -133,6 +133,7 @@ web_server:
   version: 3
   local: true
   auth:
+    type: digest                 # password never sent in clear
     username: admin
     password: !secret web_password
 
@@ -986,6 +987,7 @@ script:
           if (id(buzzer).is_playing()) id(buzzer).stop();
           id(tune_prio) = prio;
           id(buzzer).play(r);
+          ESP_LOGW("buzzer", "tune %s", tune.c_str());
   - id: ui_sync_all
     then:
       - script.execute: { id: set_ui, what: 1, slot: 0, dir: 0 }
@@ -1012,6 +1014,7 @@ script:
     parameters:
       msg: string
     then:
+      - logger.log: { level: WARN, tag: notify, format: "%s", args: [msg.c_str()] }
       - lvgl.label.update:
           id: lbl_alert
           text: !lambda 'return msg;'
