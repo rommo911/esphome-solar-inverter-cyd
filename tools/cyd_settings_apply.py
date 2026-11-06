@@ -1,5 +1,7 @@
 """Regenerate the settings in inverter-cyd.yaml from cyd_settings.py:
 the number: and switch: sections, the ui_sync_all script and the restore_defaults script.
+The controller's settings are created by the solar_autopilot component itself (same ids and
+names, see components/solar_autopilot/settings_keys.py); only the others go to number: / switch:.
 
   python3 cyd_settings_apply.py inverter-cyd.yaml
 
@@ -11,6 +13,10 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from cyd_settings import NUMBERS, SWITCHES, VIRTUAL_NIDS  # noqa: E402
+
+_keys = {}
+exec(open(__file__.rsplit("/", 1)[0] + "/../components/solar_autopilot/settings_keys.py").read(), _keys)
+COMPONENT_IDS = {v[0] for v in _keys["NUMBERS"].values()} | {v[0] for v in _keys["SWITCHES"].values()}
 
 path = sys.argv[1]
 s = open(path).read()
@@ -121,11 +127,12 @@ def switch_yaml(sw):
 
 
 a, b = section_span("number")
-s = s[:a] + ("number:\n  # Generated from tools/cyd_settings.py. All settings are exposed to Home Assistant.\n"
-             + "".join(number_yaml(n) for n in NUMBERS) + "\n") + s[b:]
+s = s[:a] + ("number:\n  # Generated from tools/cyd_settings.py: display / LED settings. The controller's settings\n"
+             "  # are created by solar_autopilot (on_setting_change refreshes the screen).\n"
+             + "".join(number_yaml(n) for n in NUMBERS if n[0] not in COMPONENT_IDS) + "\n") + s[b:]
 a, b = section_span("switch")
-s = s[:a] + ("switch:\n  # Generated from tools/cyd_settings.py.\n"
-             + "".join(switch_yaml(w) for w in SWITCHES) + "\n") + s[b:]
+s = s[:a] + ("switch:\n  # Generated from tools/cyd_settings.py (the controller's switches: solar_autopilot).\n"
+             + "".join(switch_yaml(w) for w in SWITCHES if w[0] not in COMPONENT_IDS) + "\n") + s[b:]
 
 # ui_sync_all / restore_defaults
 a, b = script_span("ui_sync_all")

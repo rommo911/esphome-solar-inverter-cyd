@@ -32,6 +32,7 @@ namespace solar_autopilot {
 
 class TuneTrigger;
 class NotifyTrigger;
+class SettingTrigger;
 
 // entities the component publishes (sensor.py / binary_sensor.py / text_sensor.py)
 enum OutSensor : uint8_t {
@@ -91,6 +92,7 @@ class SolarAutopilot : public Component {
 #endif
   void add_tune_trigger(TuneTrigger *t) { tune_triggers_.push_back(t); }
   void add_notify_trigger(NotifyTrigger *t) { notify_triggers_.push_back(t); }
+  void add_setting_trigger(SettingTrigger *t) { setting_triggers_.push_back(t); }
 
   // for lambdas: id(autopilot).status().reserve_sw, id(autopilot).link() ...
   void mark_data() { last_data_ms_ = millis(); }   // every inverter reply (automatic: the SOC sensor's raw values)
@@ -148,6 +150,45 @@ class SolarAutopilot : public Component {
 #endif
   std::vector<TuneTrigger *> tune_triggers_;
   std::vector<NotifyTrigger *> notify_triggers_;
+  std::vector<SettingTrigger *> setting_triggers_;
+};
+
+// A setting the component creates itself: saved in flash like a template number with
+// restore_value (same storage key for the same name, so values survive moving from one to the other).
+class SettingNumber : public number::Number, public Component {
+ public:
+  void set_initial_value(float v) { initial_ = v; }
+  void setup() override {
+    float v;
+    this->pref_ = this->make_entity_preference<float>();
+    if (!this->pref_.load(&v)) v = this->initial_;
+    this->publish_state(v);
+  }
+  float get_setup_priority() const override { return setup_priority::HARDWARE; }   // before anything reads it
+
+ protected:
+  void control(float v) override {
+    this->publish_state(v);
+    this->pref_.save(&v);
+  }
+  float initial_ = NAN;
+  ESPPreferenceObject pref_;
+};
+
+// A switch setting the component creates itself (restore_mode as configured, default per setting).
+class SettingSwitch : public switch_::Switch, public Component {
+ public:
+  void setup() override {
+    const optional<bool> s = this->get_initial_state_with_restore_mode();
+    if (s.has_value()) {
+      if (*s) this->turn_on();
+      else this->turn_off();
+    }
+  }
+  float get_setup_priority() const override { return setup_priority::HARDWARE; }
+
+ protected:
+  void write_state(bool state) override { this->publish_state(state); }
 };
 
 class TuneTrigger : public Trigger<std::string, int, bool> {
@@ -158,6 +199,12 @@ class TuneTrigger : public Trigger<std::string, int, bool> {
 class NotifyTrigger : public Trigger<std::string> {
  public:
   explicit NotifyTrigger(SolarAutopilot *parent) { parent->add_notify_trigger(this); }
+};
+
+// any setting changed (key, e.g. "cloudy_kwh"): refresh a screen
+class SettingTrigger : public Trigger<std::string> {
+ public:
+  explicit SettingTrigger(SolarAutopilot *parent) { parent->add_setting_trigger(this); }
 };
 
 }  // namespace solar_autopilot

@@ -6,8 +6,18 @@ from esphome import automation
 import esphome.codegen as cg
 from esphome.components import binary_sensor, http_request, number, pipsolar, select, sensor, sun, switch, time
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_LATITUDE, CONF_LONGITUDE, CONF_PLATFORM, CONF_TIME_ID, CONF_TRIGGER_ID
-from esphome.core import CORE
+from esphome.const import (
+    CONF_ID,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
+    CONF_MODE,
+    CONF_NAME,
+    CONF_PLATFORM,
+    CONF_TIME_ID,
+    CONF_TRIGGER_ID,
+    ENTITY_CATEGORY_CONFIG,
+)
+from esphome.core import CORE, ID
 import esphome.final_validate as fv
 
 from .settings_keys import NUMBERS, SWITCHES
@@ -21,6 +31,9 @@ TuneTrigger = solar_autopilot_ns.class_(
     "TuneTrigger", automation.Trigger.template(cg.std_string, cg.int_, cg.bool_)
 )
 NotifyTrigger = solar_autopilot_ns.class_("NotifyTrigger", automation.Trigger.template(cg.std_string))
+SettingTrigger = solar_autopilot_ns.class_("SettingTrigger", automation.Trigger.template(cg.std_string))
+SettingNumber = solar_autopilot_ns.class_("SettingNumber", number.Number, cg.Component)
+SettingSwitch = solar_autopilot_ns.class_("SettingSwitch", switch.Switch, cg.Component)
 
 CONF_SOLAR_AUTOPILOT_ID = "solar_autopilot_id"
 CONF_SUN_ID = "sun_id"
@@ -29,6 +42,7 @@ CONF_REPEAT_SOC = "alarm_repeat_soc"
 CONF_SETTINGS = "settings"
 CONF_ON_TUNE = "on_tune"
 CONF_ON_NOTIFY = "on_notify"
+CONF_ON_SETTING_CHANGE = "on_setting_change"
 CONF_FORECAST = "forecast"
 CONF_GRID_VOLTAGE = "grid_voltage"
 CONF_GRID_MIN_VOLTAGE = "grid_min_voltage"
@@ -79,9 +93,40 @@ SELECTS = {
     "float_voltage": "set_float_voltage",
 }
 
+# Every setting is a number / switch entity the component creates (config category, saved in
+# flash, in Home Assistant). Per key you can change it like any entity (name, id, internal, ...)
+# or give the id of an entity of your own instead.
+def _number_schema(key):
+    did, name, unit, *_ = NUMBERS[key]
+    return number.number_schema(
+        SettingNumber, entity_category=ENTITY_CATEGORY_CONFIG, unit_of_measurement=unit
+    ).extend(
+        {
+            cv.Optional(CONF_ID, default=did): cv.declare_id(SettingNumber),
+            cv.Optional(CONF_NAME, default=name): cv.string,
+            cv.Optional(CONF_MODE, default="BOX"): cv.enum(number.NUMBER_MODES, upper=True),
+        }
+    ).extend(cv.COMPONENT_SCHEMA)
+
+
+def _switch_schema(key):
+    did, name, on, icon = SWITCHES[key]
+    return switch.switch_schema(
+        SettingSwitch,
+        default_restore_mode="RESTORE_DEFAULT_ON" if on else "RESTORE_DEFAULT_OFF",
+        entity_category=ENTITY_CATEGORY_CONFIG,
+        icon=icon or cv.UNDEFINED,
+    ).extend(
+        {
+            cv.Optional(CONF_ID, default=did): cv.declare_id(SettingSwitch),
+            cv.Optional(CONF_NAME, default=name): cv.string,
+        }
+    ).extend(cv.COMPONENT_SCHEMA)
+
+
 SETTINGS_SCHEMA = cv.Schema(
-    {**{cv.Optional(k): cv.use_id(number.Number) for k in NUMBERS},
-     **{cv.Optional(k): cv.use_id(switch.Switch) for k in SWITCHES}}
+    {**{cv.Optional(k, default={}): cv.Any(cv.use_id(number.Number), _number_schema(k)) for k in NUMBERS},
+     **{cv.Optional(k, default={}): cv.Any(cv.use_id(switch.Switch), _switch_schema(k)) for k in SWITCHES}}
 )
 
 CONFIG_SCHEMA = cv.Schema(
@@ -112,6 +157,9 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_ON_NOTIFY): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(NotifyTrigger)}
+        ),
+        cv.Optional(CONF_ON_SETTING_CHANGE): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SettingTrigger)}
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -177,7 +225,16 @@ async def to_code(config):
         if key in config:
             cg.add(getattr(var, setter)(await cg.templatable(config[key], [], cg.float_)))
     for key, value in config[CONF_SETTINGS].items():
-        ent = await cg.get_variable(value)
+        if isinstance(value, ID):            # an entity of your own
+            ent = await cg.get_variable(value)
+        elif key in NUMBERS:
+            _, _, _, lo, hi, st, dv = NUMBERS[key]
+            ent = await number.new_number(value, min_value=lo, max_value=hi, step=st)
+            await cg.register_component(ent, value)
+            cg.add(ent.set_initial_value(dv))
+        else:
+            ent = await switch.new_switch(value)
+            await cg.register_component(ent, value)
         if key in NUMBERS:
             cg.add(var.set_number(cg.RawExpression(f"autopilot_core::N_{key}"), ent))
         else:
@@ -190,3 +247,6 @@ async def to_code(config):
     for conf in config.get(CONF_ON_NOTIFY, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [(cg.std_string, "message")], conf)
+    for conf in config.get(CONF_ON_SETTING_CHANGE, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [(cg.std_string, "key")], conf)

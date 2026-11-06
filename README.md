@@ -366,10 +366,10 @@ command line while a dashboard build runs: they share one build folder.
 
 | Part | Source | Apply |
 |---|---|---|
-| `number:` / `switch:`, `ui_sync_all`, `restore_defaults` | `tools/cyd_settings.py` | `python3 tools/cyd_settings_apply.py inverter-cyd.yaml` |
+| `number:` / `switch:` (display and LED only), `ui_sync_all`, `restore_defaults` | `tools/cyd_settings.py` | `python3 tools/cyd_settings_apply.py inverter-cyd.yaml` |
 | `lvgl:` section, `ui_refresh_values`, `set_ui` (shared settings page) | `tools/cyd_ui.py` (pages of settings rows: `VPAGES` in `cyd_settings.py`) | run `cyd_ui.py check / render / yaml / script` in the container, then `tools/cyd_ui_inject.py` |
 | Settings tables in this README | `tools/cyd_settings.py` | `python3 tools/cyd_readme.py README.md` |
-| Controller `Settings` (`ap_settings.h`, `settings_keys.py`) and the `settings:` block of `solar_autopilot:` | `tools/cyd_settings.py` | `python3 tools/gen_autopilot_settings.py` (then update the `settings:` block if a key was added) |
+| The controller's settings: `ap_settings.h` (core) and `settings_keys.py` (the entities the component creates) | `tools/cyd_settings.py` | `python3 tools/gen_autopilot_settings.py` |
 
 `cyd_ui.py check` verifies against LVGL's real Montserrat glyph widths that no text overlaps or
 leaves the screen; `render` draws PNG previews.

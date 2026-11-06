@@ -30,6 +30,21 @@ void SolarAutopilot::setup() {
       if (!std::isnan(x)) this->mark_data();
     });
   }
+  // settings changed (screen, Home Assistant, restore defaults) -> on_setting_change
+  for (uint8_t i = 0; i < autopilot_core::NUMBER_COUNT; i++) {
+    if (this->numbers_[i] == nullptr) continue;
+    const char *key = autopilot_core::NUMBER_INFO[i].key;
+    this->numbers_[i]->add_on_state_callback([this, key](float) {
+      for (auto *t : this->setting_triggers_) t->trigger(std::string(key));
+    });
+  }
+  for (uint8_t i = 0; i < autopilot_core::SWITCH_COUNT; i++) {
+    if (this->switches_[i] == nullptr) continue;
+    const char *key = autopilot_core::SWITCH_INFO[i].key;
+    this->switches_[i]->add_on_state_callback([this, key](bool) {
+      for (auto *t : this->setting_triggers_) t->trigger(std::string(key));
+    });
+  }
   if (this->grid_ != nullptr) {
     this->grid_->add_on_state_callback([this](bool state) {
       if (!this->grid_seen_) {   // first reading after boot: no sound

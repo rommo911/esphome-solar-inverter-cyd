@@ -78,7 +78,8 @@ solar_autopilot:
   id: autopilot
   pipsolar_id: my_inverter           # that's all for the inverter (see below)
   forecast: { latitude: 36.15, longitude: 36.73 }    # optional, needs http_request:
-  settings: { cloudy_kwh: n_cloudy_kwh }             # optional: bind settings to number / switch entities
+  on_setting_change:                                 # optional: e.g. refresh a screen
+    - logger.log: { format: "setting %s changed", args: [key.c_str()] }
   on_tune:
     - logger.log: { format: "sound %s", args: [tune.c_str()] }
   on_notify:
@@ -157,7 +158,21 @@ lambdas, for example from Home Assistant. The core's `Forecast` class (`ap_forec
 scheduling, the URLs and the reply parsing without a JSON library. On another platform you only
 do the HTTPS GET.
 
-Unbound settings use their defaults. `inverter-cyd.yaml` is the complete
+**Settings.** The component creates every setting as an entity: 42 numbers and 10 switches,
+in the config category, saved in flash, and shown in Home Assistant. Each has its name, unit,
+range, step and default from `settings_keys.py`, and ids `n_<key>` / `sw_<key>` (for example
+`n_cloudy_kwh` or `sw_observe`), so lambdas can use `id(n_cloudy_kwh).state`. You can change one
+like any entity, or give the id of your own entity instead:
+
+```yaml
+solar_autopilot:
+  settings:
+    cloudy_kwh: { name: "Cloudy Day Below", internal: true }
+    batt_kwh: my_battery_capacity_number
+```
+
+They use the same flash storage as template numbers and switches with the same name, so moving
+from template entities to these keeps the values already saved. `inverter-cyd.yaml` is the complete
 example.
 
 ## Changing the logic

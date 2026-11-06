@@ -123,17 +123,8 @@ static float sim_fc_today = NAN, sim_fc_tomorrow = NAN;   // the forecast the wo
 struct SimAutopilot {
   autopilot_core::Controller ctl;
   uint32_t last_data = 0;
-  autopilot_core::Settings settings() const {
-    autopilot_core::Settings s;
-#define AP_NUM(k, d) s.k = n_##k.state;
-    AUTOPILOT_NUMBERS(AP_NUM)
-#undef AP_NUM
-    s.auto_ctl = auto_ctl.state; s.observe = sw_observe.state;
-    s.rule_low = sw_rule_low.state; s.rule_high = sw_rule_high.state; s.rule_night = sw_rule_night.state;
-    s.rule_ovn = sw_rule_ovn.state; s.rule_charge = sw_rule_charge.state; s.rule_float = sw_rule_float.state;
-    s.buzzer = sw_buzzer.state; s.quiet = sw_quiet.state;
-    return s;
-  }
+  autopilot_core::Settings set;   // the component's settings: defaults (= the entities' defaults)
+  autopilot_core::Settings settings() const { return set; }
   autopilot_core::Clock clock() const {
     autopilot_core::Clock c;
     const ESPTime t = sntp_time.now();
@@ -291,8 +282,13 @@ int main(int argc, char **argv) {
   std::mt19937 rng(42);
   SIM_T0_MIN = sc.start_min;
   TIME_VALID = sc.time_valid;
+#ifdef USE_CORE
+  autopilot_sim.set.auto_ctl = sc.auto_on;
+  autopilot_sim.set.observe = sc.observe;         // default is ON; tests run with it off
+#else
   auto_ctl.state = sc.auto_on;
   sw_observe.state = sc.observe;                  // YAML default is ON; tests run with it off
+#endif
   uint32_t sunrise0 = 0;
   if (sc.sunrise_known && TIME_VALID) {           // restored from the previous day
     double d0 = floor(sc.start_min / 1440.0) * 1440;
@@ -318,7 +314,12 @@ int main(int argc, char **argv) {
 #endif
   double unmet_wh = 0, grid_wh = 0;
   emit("\"ev\":\"start\",\"scenario\":\"%s\",\"desc\":\"%s\",\"start_min\":%.0f,\"alarm\":30,\"norm_a\":%.0f",
-       sc.name, sc.desc, sc.start_min, n_chg_norm_a.state);
+       sc.name, sc.desc, sc.start_min,
+#ifdef USE_CORE
+       autopilot_sim.set.chg_norm_a);
+#else
+       n_chg_norm_a.state);
+#endif
 
   const uint32_t END = (uint32_t) (sc.hours * 3600 * 1000);
   for (SIM_MS = 0; SIM_MS <= END; SIM_MS += 1000) {
