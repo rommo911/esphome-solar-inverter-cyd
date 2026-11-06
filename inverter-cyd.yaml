@@ -48,10 +48,6 @@ esphome:
           id(touch).set_swap_xy(o & 4);
           id(touch).set_mirror_x(o & 2);
           id(touch).set_mirror_y(o & 1);
-      - lambda: |-
-          id(led_r).set_max_power(id(n_led_r).state / 100.0f);
-          id(led_g).set_max_power(id(n_led_g).state / 100.0f);
-          id(led_b).set_max_power(id(n_led_b).state / 100.0f);
       - script.execute: led_selftest
       - lambda: |-
           ESP_LOGW("mem", "after screen + WiFi: free %u B, largest block %u B, lowest so far %u B",
@@ -267,15 +263,15 @@ output:
   - platform: ledc
     id: led_r
     pin: { number: GPIO4, inverted: true }
-    max_power: 100%              # runtime-scaled by the LED * Level settings
+    max_power: 100%              # full brightness
   - platform: ledc
     id: led_g
     pin: { number: GPIO16, inverted: true }
-    max_power: 100%              # runtime-scaled by the LED * Level settings
+    max_power: 100%              # full brightness
   - platform: ledc
     id: led_b
     pin: { number: GPIO17, inverted: true }
-    max_power: 100%              # runtime-scaled by the LED * Level settings
+    max_power: 100%              # full brightness
 
   # ---- Inverter writable settings (unchanged from inverter-esphome.yaml) ----
   - platform: pipsolar
@@ -453,48 +449,6 @@ number:
     initial_value: 0.0
     optimistic: true
     restore_value: true
-  - platform: template
-    id: n_led_r
-    name: "LED Red Level"
-    entity_category: config
-    unit_of_measurement: "%"
-    mode: box
-    min_value: 5
-    max_value: 100
-    step: 5
-    initial_value: 100
-    optimistic: true
-    restore_value: true
-    on_value:
-      - lambda: 'id(led_r).set_max_power(x / 100.0f);'
-  - platform: template
-    id: n_led_g
-    name: "LED Green Level"
-    entity_category: config
-    unit_of_measurement: "%"
-    mode: box
-    min_value: 5
-    max_value: 100
-    step: 5
-    initial_value: 100
-    optimistic: true
-    restore_value: true
-    on_value:
-      - lambda: 'id(led_g).set_max_power(x / 100.0f);'
-  - platform: template
-    id: n_led_b
-    name: "LED Blue Level"
-    entity_category: config
-    unit_of_measurement: "%"
-    mode: box
-    min_value: 5
-    max_value: 100
-    step: 5
-    initial_value: 100
-    optimistic: true
-    restore_value: true
-    on_value:
-      - lambda: 'id(led_b).set_max_power(x / 100.0f);'
 
 interval:
   # The controller (rules, planner, charger, alarms) is the solar_autopilot component below.
@@ -521,7 +475,7 @@ interval:
           }
           auto call = id(status_led).turn_on();
           call.set_rgb(rr, gg, bb);
-          call.set_brightness(1.0);             // always full; balance colours with LED * Level
+          call.set_brightness(1.0);             // always full
           call.set_transition_length(0);
           call.perform();
 

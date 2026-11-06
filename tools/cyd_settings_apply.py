@@ -74,11 +74,7 @@ def number_yaml(n):
     optimistic: true
     restore_value: true
 """
-    if kind == "led":
-        y += f"""    on_value:
-      - lambda: 'id(led_{nid[-1]}).set_max_power(x / 100.0f);'
-"""
-    elif nid in VIRTUAL_NIDS:      # shown on the shared settings page: refresh its values
+    if nid in VIRTUAL_NIDS:      # shown on the shared settings page: refresh its values
         y += """    on_value:
       - if:
           condition:

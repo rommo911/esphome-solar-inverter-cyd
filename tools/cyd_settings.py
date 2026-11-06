@@ -5,7 +5,7 @@ cyd_ui.py (screen rows). All settings are exposed to Home Assistant (entity_cate
 """
 
 # id, HA name, unit, min, max, step, default, screen label, value format, kind
-#   kind: "" = normal, "calib" = hardware calibration (kept by Restore defaults), "led" = LED level
+#   kind: "" = normal, "calib" = hardware calibration (kept by Restore defaults)
 NUMBERS = [
     # --- reserve planner (handoff 4A)
     ("n_cloudy_kwh", "Cloudy Below", "kWh", 0, 20, 0.5, 5, "Cloudy if forecast below", "%.1f kWh", ""),
@@ -61,9 +61,6 @@ NUMBERS = [
     ("n_bl_min", "Backlight Min (auto)", "%", 5, 100, 5, 20, "Auto min brightness", "%.0f %%", ""),
     ("n_ldr_dark", "LDR Dark Reading", "V", 0, 1.2, 0.001, 0.3, None, None, "calib"),
     ("n_ldr_bright", "LDR Bright Reading", "V", 0, 1.2, 0.001, 0.0, None, None, "calib"),
-    ("n_led_r", "LED Red Level", "%", 5, 100, 5, 100, None, None, "led"),
-    ("n_led_g", "LED Green Level", "%", 5, 100, 5, 100, None, None, "led"),
-    ("n_led_b", "LED Blue Level", "%", 5, 100, 5, 100, None, None, "led"),
 ]
 
 # id, HA name, default on, screen widget id (None = HA only), icon, extra YAML for on_turn_off

@@ -17,7 +17,7 @@ from cyd_settings import NUMBERS, SWITCHES  # noqa: E402
 
 OUT = os.path.join(HERE, "..", "components", "solar_autopilot")
 NOT_CORE = {"n_bl_min", "n_ldr_dark", "n_ldr_bright",
-            "n_led_r", "n_led_g", "n_led_b", "sw_autobl", "sw_touchdbg"}
+            "sw_autobl", "sw_touchdbg"}
 
 
 def key(i):

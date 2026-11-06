@@ -277,9 +277,6 @@ This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
 | Backlight Min (auto) | 20 % | 5 to 100 | 5 | yes | no |
 | LDR Dark Reading | 0.3 V | 0 to 1.2 | 0.001 | no (HA only) | yes |
 | LDR Bright Reading | 0 V | 0 to 1.2 | 0.001 | no (HA only) | yes |
-| LED Red Level | 100 % | 5 to 100 | 5 | no (HA only) | yes |
-| LED Green Level | 100 % | 5 to 100 | 5 | no (HA only) | yes |
-| LED Blue Level | 100 % | 5 to 100 | 5 | no (HA only) | yes |
 
 **Switches**
 
