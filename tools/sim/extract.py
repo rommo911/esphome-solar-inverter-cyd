@@ -59,13 +59,14 @@ def grab(name, fn):
         pass
 
 
-bsg = next(b for b in cfg["binary_sensor"] if b.get("id") == "bs_grid")
-grab("grid_raw", lambda: bsg["lambda"])
-grab("grid_cond", lambda: bsg["on_release"][0]["if"]["condition"]["lambda"])
-pip_bs = next(b for b in cfg["binary_sensor"] if b.get("platform") == "pipsolar")
-grab("float_cond", lambda: pip_bs["charging_to_floating_mode"]["on_press"][0]["if"]["condition"]["lambda"])
-inv = next(b for b in cfg["binary_sensor"] if b.get("id") == "inv_link")
-grab("inv_link", lambda: inv["lambda"])
+def bs(key, val):
+    return next(b for b in cfg["binary_sensor"] if b.get(key) == val)
+
+
+grab("grid_raw", lambda: bs("id", "bs_grid")["lambda"])
+grab("grid_cond", lambda: bs("id", "bs_grid")["on_release"][0]["if"]["condition"]["lambda"])
+grab("float_cond", lambda: bs("platform", "pipsolar")["charging_to_floating_mode"]["on_press"][0]["if"]["condition"]["lambda"])
+grab("inv_link", lambda: bs("id", "inv_link")["lambda"])
 
 SIGS = {
     "controller": "void L_controller()", "planner": "void L_planner()", "alarms": "void L_alarms()",

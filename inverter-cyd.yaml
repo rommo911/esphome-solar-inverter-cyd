@@ -4034,25 +4034,15 @@ sensor:
     state_class: total_increasing
     accuracy_decimals: 3
     filters: [multiply: 0.001]
-  # ---- controller plan (exposed to Home Assistant)
-  - platform: template
-    name: "Reserve Switch SOC"
-    unit_of_measurement: "%"
-    accuracy_decimals: 0
-    update_interval: 60s
-    lambda: 'return id(autopilot).status().reserve_sw;'
-  - platform: template
-    name: "Reserve Return SOC"
-    unit_of_measurement: "%"
-    accuracy_decimals: 0
-    update_interval: 60s
-    lambda: 'return id(autopilot).status().reserve_ret;'
-  - platform: template
-    name: "Solar Forecast Used"
-    unit_of_measurement: kWh
-    accuracy_decimals: 1
-    update_interval: 60s
-    lambda: 'return id(autopilot).status().plan_fc;'
+  # ---- controller plan (exposed to Home Assistant): published by the component every minute
+  - platform: solar_autopilot
+    reserve_switch: { name: "Reserve Switch SOC" }
+    reserve_return: { name: "Reserve Return SOC" }
+    forecast_used: { name: "Solar Forecast Used" }
+    soc_at_sun: { name: "Predicted SOC At Sun" }
+    base_load: { name: "Base Load" }
+    battery_remaining: { name: "Battery Remaining" }
+    battery_runtime: { name: "Battery Runtime" }     # at the base load
   - platform: template
     name: "Solar Forecast Today"
     unit_of_measurement: kWh
@@ -4065,37 +4055,6 @@ sensor:
     accuracy_decimals: 1
     update_interval: 60s
     lambda: 'return id(fc_tomorrow_kwh);'
-  - platform: template
-    name: "Predicted SOC At Sun"
-    unit_of_measurement: "%"
-    accuracy_decimals: 0
-    update_interval: 60s
-    lambda: 'return id(autopilot).status().soc_at_sun;'
-  - platform: template
-    name: "Base Load"
-    unit_of_measurement: W
-    device_class: power
-    accuracy_decimals: 0
-    update_interval: 60s
-    lambda: 'return id(autopilot).status().base_load;'
-  - platform: template
-    name: "Battery Remaining"
-    unit_of_measurement: kWh
-    accuracy_decimals: 2
-    update_interval: 30s
-    lambda: |-
-      const float soc = id(s_soc).state;
-      if (!id(inv_link).state || isnan(soc)) return {};
-      return std::max(0.0f, id(n_batt_kwh).state * (soc - id(n_empty_soc).state) / 100.0f);
-  - platform: template
-    name: "Battery Runtime"
-    unit_of_measurement: h
-    accuracy_decimals: 1
-    update_interval: 60s
-    lambda: |-
-      const float soc = id(s_soc).state;
-      if (!id(inv_link).state || isnan(soc)) return {};
-      return std::max(0.0f, id(n_batt_kwh).state * 10.0f * (soc - id(n_empty_soc).state)) / id(autopilot).status().base_load;
   - platform: total_daily_energy
     id: e_load_today
     name: "Load Energy Today"
@@ -4206,16 +4165,13 @@ sensor:
 
 
 binary_sensor:
-  - platform: template
-    name: "Cloudy Day Plan"
-    lambda: 'return id(autopilot).status().cloudy;'
-  - platform: template
-    name: "Grid Charging Active"
-    lambda: 'return id(autopilot).status().charging;'
-  - platform: template
-    name: "Controller Fault"
-    device_class: problem
-    lambda: 'return id(autopilot).status().fault;'
+  # Controller flags. "Inverter Link" = fresh inverter data (reply < 30 s, SOC and load known):
+  # pipsolar sensors keep their last value when the link drops, so the screen and HA go by this.
+  - platform: solar_autopilot
+    link: { id: inv_link, name: "Inverter Link" }
+    cloudy: { name: "Cloudy Day Plan" }
+    charging: { name: "Grid Charging Active" }
+    fault: { name: "Controller Fault" }
   # BOOT button (GPIO0, only a strapping pin at reset): each press = next touch orientation
   - platform: gpio
     id: btn_boot
@@ -4237,15 +4193,6 @@ binary_sensor:
             return str_sprintf("Touch %u/8: swap %s, mirror X %s, Y %s", o + 1,
                                (o & 4) ? "on" : "off", (o & 2) ? "on" : "off", (o & 1) ? "on" : "off");
       - script.execute: bl_wake
-
-  # Fresh inverter data (< 30 s). Pipsolar sensors keep their last value when the
-  # link drops, so the screen and the inverter controls go by this, not by NaN.
-  - platform: template
-    id: inv_link
-    name: "Inverter Link"
-    device_class: connectivity
-    entity_category: diagnostic
-    lambda: 'return id(autopilot).link();'   # reply < 30 s ago, SOC and load known
 
   - platform: pipsolar
     pipsolar_id: my_inverter
@@ -4306,23 +4253,8 @@ text_sensor:
     entity_category: diagnostic
     update_interval: 30s
     lambda: 'return id(fc_detail);'
-  - platform: template
-    name: "Controller State"
-    update_interval: 10s
-    lambda: |-
-      if (!id(inv_link).state) return std::string("no inverter data");
-      const uint8_t r = id(autopilot).status().reasons;
-      std::string why;
-      if (r & 1) why += " LOW";
-      if (r & 2) why += " HIGH";
-      if (r & 4) why += " NIGHT";
-      if (r & 8) why += " OVERNIGHT";
-      if (r & 16) why += " CHARGE";
-      std::string s = std::string(id(autopilot).status().want_sub ? "grid (SUB)" : "battery (SBU)") + why;
-      if (!id(auto_ctl).state) s = "manual";
-      else if (id(sw_observe).state) s = "observe only: would " + s;
-      if (id(autopilot).status().fault) s += ", FAULT";
-      return s;
+  - platform: solar_autopilot
+    state: { name: "Controller State" }
   - platform: pipsolar
     pipsolar_id: my_inverter
     device_mode:

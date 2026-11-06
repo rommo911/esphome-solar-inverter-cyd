@@ -3,6 +3,7 @@
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/number/number.h"
@@ -11,6 +12,9 @@
 #include "esphome/components/sun/sun.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/time/real_time_clock.h"
+#ifdef USE_TEXT_SENSOR
+#include "esphome/components/text_sensor/text_sensor.h"
+#endif
 
 #include <string>
 #include <vector>
@@ -22,6 +26,13 @@ namespace solar_autopilot {
 
 class TuneTrigger;
 class NotifyTrigger;
+
+// entities the component publishes (sensor.py / binary_sensor.py / text_sensor.py)
+enum OutSensor : uint8_t {
+  OUT_RESERVE_SWITCH, OUT_RESERVE_RETURN, OUT_FORECAST_USED, OUT_SOC_AT_SUN, OUT_BASE_LOAD,
+  OUT_BATTERY_REMAINING, OUT_BATTERY_RUNTIME, OUT_SENSOR_COUNT
+};
+enum OutBinary : uint8_t { OUT_LINK, OUT_CLOUDY, OUT_CHARGING, OUT_FAULT, OUT_BINARY_COUNT };
 
 class SolarAutopilot : public Component {
  public:
@@ -51,6 +62,11 @@ class SolarAutopilot : public Component {
   void set_float_voltage(select::Select *s) { sel_float_ = s; }
   void set_number(autopilot_core::NumberId id, number::Number *n) { numbers_[id] = n; }
   void set_switch(autopilot_core::SwitchId id, switch_::Switch *s) { switches_[id] = s; }
+  void set_out_sensor(OutSensor k, sensor::Sensor *s) { out_sensors_[k] = s; }
+  void set_out_binary(OutBinary k, binary_sensor::BinarySensor *b) { out_binaries_[k] = b; }
+#ifdef USE_TEXT_SENSOR
+  void set_state_text(text_sensor::TextSensor *t) { state_text_ = t; }
+#endif
   void add_tune_trigger(TuneTrigger *t) { tune_triggers_.push_back(t); }
   void add_notify_trigger(NotifyTrigger *t) { notify_triggers_.push_back(t); }
 
@@ -68,6 +84,7 @@ class SolarAutopilot : public Component {
   autopilot_core::Settings settings_();
   void run_(const autopilot_core::Actions &acts);
   void save_();
+  void publish_(bool minute);
 
   autopilot_core::Controller ctl_;
   autopilot_core::AlarmConfig cfg_;
@@ -85,6 +102,11 @@ class SolarAutopilot : public Component {
   select::Select *sel_out_ = nullptr, *sel_chg_ = nullptr, *sel_cur_ = nullptr, *sel_float_ = nullptr;
   number::Number *numbers_[autopilot_core::NUMBER_COUNT] = {};
   switch_::Switch *switches_[autopilot_core::SWITCH_COUNT] = {};
+  sensor::Sensor *out_sensors_[OUT_SENSOR_COUNT] = {};
+  binary_sensor::BinarySensor *out_binaries_[OUT_BINARY_COUNT] = {};
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *state_text_ = nullptr;
+#endif
   std::vector<TuneTrigger *> tune_triggers_;
   std::vector<NotifyTrigger *> notify_triggers_;
 };

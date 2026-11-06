@@ -20,6 +20,7 @@ TuneTrigger = solar_autopilot_ns.class_(
 )
 NotifyTrigger = solar_autopilot_ns.class_("NotifyTrigger", automation.Trigger.template(cg.std_string))
 
+CONF_SOLAR_AUTOPILOT_ID = "solar_autopilot_id"
 CONF_SUN_ID = "sun_id"
 CONF_ALARM_SOC = "alarm_soc"
 CONF_REPEAT_SOC = "alarm_repeat_soc"

@@ -93,6 +93,34 @@ solar_autopilot:
     - logger.log: { format: "%s", args: [message.c_str()] }
 ```
 
+The component publishes its results as entities, so you don't need template sensors. Every key
+is optional and takes the usual options (`name`, `id`, `internal`, filters, and so on):
+
+```yaml
+sensor:
+  - platform: solar_autopilot     # published every minute
+    reserve_switch: { name: "Reserve Switch SOC" }
+    reserve_return: { name: "Reserve Return SOC" }
+    forecast_used: { name: "Solar Forecast Used" }
+    soc_at_sun: { name: "Predicted SOC At Sun" }
+    base_load: { name: "Base Load" }
+    battery_remaining: { name: "Battery Remaining" }
+    battery_runtime: { name: "Battery Runtime" }     # at the base load
+binary_sensor:
+  - platform: solar_autopilot     # every 2 s
+    link: { id: inv_link, name: "Inverter Link" }   # fresh inverter data
+    cloudy: { name: "Cloudy Day Plan" }
+    charging: { name: "Grid Charging Active" }
+    fault: { name: "Controller Fault" }
+text_sensor:
+  - platform: solar_autopilot
+    state: { name: "Controller State" }             # e.g. "grid (SUB) LOW CHARGE"
+```
+
+For screen lambdas, everything is also available directly: `id(autopilot).status().reserve_sw`
+and `id(autopilot).link()`. Status covers reasons, want_sub, cloudy, charging, soc_at_sun,
+base_load, fault and more.
+
 Feed it the inverter replies with `id(autopilot).mark_data();` in a pipsolar sensor's
 `on_raw_value`. Unbound settings use their defaults. `inverter-cyd.yaml` is the complete
 example.

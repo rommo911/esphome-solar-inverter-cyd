@@ -45,12 +45,14 @@ void SolarAutopilot::setup() {
     this->ctl_.control(this->clock_(), this->inputs_(), this->settings_(), a);
     this->run_(a);
     this->save_();
+    this->publish_(false);
   });
   this->set_interval("minute", 60000, [this]() {
     autopilot_core::Actions a;
     this->ctl_.minute(this->clock_(), this->inputs_(), this->settings_(), a);
     this->run_(a);
     this->save_();
+    this->publish_(true);
   });
 }
 
@@ -147,6 +149,31 @@ void SolarAutopilot::run_(const autopilot_core::Actions &acts) {
     }
   }
   if (acts.dropped() != 0) ESP_LOGE(TAG, "%u actions dropped (queue full)", (unsigned) acts.dropped());
+}
+
+// binary sensors and the state text every 2 s (published on change), values once a minute
+void SolarAutopilot::publish_(bool minute) {
+  const autopilot_core::Status st = this->ctl_.status();
+  const autopilot_core::Inputs in = this->inputs_();
+  const autopilot_core::Settings s = this->settings_();
+  const bool link = autopilot_core::Controller::link(this->clock_(), in);
+  const bool bin[OUT_BINARY_COUNT] = {link, st.cloudy, st.charging, st.fault};
+  for (uint8_t i = 0; i < OUT_BINARY_COUNT; i++)
+    if (this->out_binaries_[i] != nullptr) this->out_binaries_[i]->publish_state(bin[i]);
+#ifdef USE_TEXT_SENSOR
+  if (this->state_text_ != nullptr) {
+    char buf[96];
+    autopilot_core::describe(st, s, link, buf, sizeof buf);
+    if (!this->state_text_->has_state() || this->state_text_->state != buf) this->state_text_->publish_state(buf);
+  }
+#endif
+  if (!minute) return;
+  const float soc = link ? in.soc : NAN;
+  const float val[OUT_SENSOR_COUNT] = {
+      st.reserve_sw, st.reserve_ret, st.plan_fc, st.soc_at_sun, st.base_load,
+      autopilot_core::battery_remaining_kwh(soc, s), autopilot_core::battery_runtime_h(soc, st.base_load, s)};
+  for (uint8_t i = 0; i < OUT_SENSOR_COUNT; i++)
+    if (this->out_sensors_[i] != nullptr) this->out_sensors_[i]->publish_state(val[i]);
 }
 
 void SolarAutopilot::save_() {

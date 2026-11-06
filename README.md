@@ -339,7 +339,9 @@ readings in on every call and performs the actions it returns. The same core run
 The ESPHome side (`solar_autopilot.{h,cpp}`, `__init__.py`) reads the entities, calls the core
 every 2 s (`control`) and every minute (`minute`), writes the selects, saves the state that must
 survive a reboot, and fires `on_tune` / `on_notify` (the YAML plays the sound and shows the
-message). Screen and HA lambdas read the results with `id(autopilot).status()` (for example
+message). It also creates the Home Assistant entities for its results (`platform: solar_autopilot`
+under `sensor:`, `binary_sensor:` and `text_sensor:`, for example "Reserve Switch SOC", "Inverter
+Link" and "Controller State"). Screen lambdas read the results with `id(autopilot).status()` (for example
 `.reserve_sw`, `.reasons`, `.soc_at_sun`), `id(autopilot).link()` and `id(autopilot).last_data_ms()`.
 How to use the core elsewhere: [components/solar_autopilot/README.md](components/solar_autopilot/README.md).
 

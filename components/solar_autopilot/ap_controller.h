@@ -19,6 +19,9 @@
 #include "ap_types.h"
 #include "ap_writers.h"
 
+#include <cstddef>
+#include <cstdio>
+
 namespace autopilot_core {
 
 class Controller {
@@ -60,6 +63,18 @@ class Controller {
   ChargerWriter charger_writer_;
   AlarmManager alarms_;
 };
+
+// Battery energy above "Battery Empty At" (kWh), and how long it lasts at a load (h). NAN if unknown.
+inline float battery_remaining_kwh(float soc, const Settings &s) {
+  return std::isnan(soc) ? NAN : std::max(0.0f, s.batt_kwh * (soc - s.empty_soc) / 100.0f);
+}
+inline float battery_runtime_h(float soc, float load_w, const Settings &s) {
+  return battery_remaining_kwh(soc, s) * 1000.0f / load_w;
+}
+
+// One line for a screen or Home Assistant, e.g. "grid (SUB) LOW CHARGE" or
+// "observe only: would battery (SBU)". Returns buf.
+const char *describe(const Status &st, const Settings &s, bool link, char *buf, size_t len);
 
 // Grid present, debounced: a change counts after it has lasted `hold_ms` (default 30 s).
 // For callers without their own filter (ESPHome uses delayed_on / delayed_off instead).

@@ -92,6 +92,23 @@ void Controller::grid_changed(bool grid, const Clock &c, const Inputs &in, Actio
   alarms_.grid_changed(grid, in.soc, cfg_, out);
 }
 
+const char *describe(const Status &st, const Settings &s, bool link, char *buf, size_t len) {
+  if (!link) {
+    snprintf(buf, len, "no inverter data");
+    return buf;
+  }
+  if (!s.auto_ctl) {
+    snprintf(buf, len, "manual%s", st.fault ? ", FAULT" : "");
+    return buf;
+  }
+  const uint8_t r = st.reasons;
+  snprintf(buf, len, "%s%s%s%s%s%s%s%s", s.observe ? "observe only: would " : "",
+           st.want_sub ? "grid (SUB)" : "battery (SBU)", (r & R_LOW) ? " LOW" : "", (r & R_HIGH) ? " HIGH" : "",
+           (r & R_NIGHT) ? " NIGHT" : "", (r & R_OVN) ? " OVERNIGHT" : "", (r & R_CHG) ? " CHARGE" : "",
+           st.fault ? ", FAULT" : "");
+  return buf;
+}
+
 void Controller::float_entered(const Inputs &in, const Settings &s, Actions &out) {
   if (s.rule_float && fabsf(in.float_voltage - s.float_v) > 0.05f)
     out.set(ActionType::SET_FLOAT_VOLTAGE, 0, s.float_v);
