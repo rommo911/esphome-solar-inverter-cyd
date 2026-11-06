@@ -301,9 +301,16 @@ This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
 - **WiFi:** DHCP (any network). The house's fixed address (192.168.10.4, gateway .1) is in the YAML,
   commented out; enable it only on that network or the board has no internet.
 - **Time:** NTP from 0.pool.ntp.org, time.google.com and time.cloudflare.com, every 5 min.
+- **Fallback hotspot:** if the board cannot join the WiFi for 1 min, it opens "inverter-cyd
+  Fallback" (password `ap_password` in `secrets.yaml`). Join it with a phone: the captive portal
+  asks for the new WiFi name and password. The controller keeps running without WiFi.
+- **Web page:** `http://<board IP>/`, or `http://192.168.4.1` on the hotspot. User `admin`,
+  password `web_password` in `secrets.yaml`. It shows every entity and setting and the live log,
+  and works without internet (`local: true`). Each open page holds a connection and some heap, and
+  HTTPS for the forecast needs 45 KB free. Close the page if the forecast reports "low memory".
 - **Home Assistant API: off by default.** Uncomment `api:` (and the `homeassistant` time source) to
-  connect HA. Without the API the dashboard's WiFi log viewer does not work; read logs over USB
-  (web.esphome.io). OTA updates work either way.
+  connect HA. Without the API the dashboard's WiFi log viewer does not work; read the log on the
+  web page, or over USB (web.esphome.io). OTA updates work either way.
 - **Exposed to HA:** all settings and switches; the useful readings (SOC, battery V/W, PV, load, grid
   V/W, temperature); cumulative energy for HA's Energy dashboard; the plan (reserve, forecast,
   predicted SOC at sun, base load, battery kWh and runtime, Controller State, Cloudy Day Plan, Grid

@@ -116,6 +116,25 @@ wifi:
   #   subnet: 255.255.255.0
   #   dns1: 8.8.8.8
   #   dns2: 8.8.4.4
+  # Fallback hotspot: if the WiFi above cannot be joined for 1 min, the board opens its own
+  # network; join it with a phone and the captive portal asks for the new WiFi name + password.
+  # The controller keeps running meanwhile (it does not need WiFi).
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+    ap_timeout: 1min
+
+captive_portal:
+
+# Web page at http://<board IP>/ (or http://192.168.4.1 on the fallback hotspot): all entities and
+# settings, live log. local: the page is in the firmware, so it works without internet.
+web_server:
+  port: 80
+  version: 3
+  local: true
+  auth:
+    username: admin
+    password: !secret web_password
 
 time:
   - platform: sntp
