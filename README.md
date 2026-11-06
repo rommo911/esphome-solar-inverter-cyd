@@ -9,7 +9,8 @@ later as a viewer and remote.
 
 | File | What it is |
 |---|---|
-| `inverter-cyd.yaml` | The ESPHome config: the only file that goes on the board |
+| `inverter-cyd.yaml` | The ESPHome config for the board: hardware, screen, forecast, entities |
+| `components/solar_autopilot/` | The controller logic: a plain C++ core plus its ESPHome component (see [Code structure](#code-structure)) |
 | `CYD_HANDOFF.md` | Background, hardware notes and the agreed design (v4 logic) |
 | `docs/screens/` | Rendered previews of every screen page |
 | `docs/proposal/` | One-page project proposal (English and Arabic) |
@@ -22,6 +23,7 @@ later as a viewer and remote.
 - [Screen, icons and LED](#screen-icons-and-led)
 - [Settings](#settings)
 - [Network and Home Assistant](#network-and-home-assistant)
+- [Code structure](#code-structure)
 - [Workflow](#workflow)
 
 ## Hardware and wiring
@@ -316,6 +318,31 @@ This list is generated from `tools/cyd_settings.py` by `tools/cyd_readme.py`.
   float too). Guard every HA automation with the **Inverter Link** entity, because HA keeps the last
   values when the board is offline. With Auto on, the controller reverts other writers within 30 s.
 
+## Code structure
+
+The decision logic described above is not YAML any more: it is the **solar autopilot core**,
+plain C++17 in `components/solar_autopilot/ap_*.{h,cpp}`. It has no Arduino, ESP-IDF or ESPHome
+dependency, no heap allocation and no clock of its own: the caller passes the time and the
+readings in on every call and performs the actions it returns. The same core runs on this board
+(ESPHome), in the simulator on a PC, and in plain Arduino or ESP-IDF projects.
+
+| Class (file) | Job |
+|---|---|
+| `Controller` (`ap_controller`) | Owns the parts below; safety gate (30 s after boot, stale data, auto / observe) |
+| `LoadStats` (`ap_load_stats`) | 1-minute load means: 3 h median (base load), 5-minute mean |
+| `SunTracker`, `ReservePlanner`, `predict_soc_at_sun` (`ap_planner`) | Sunrise time, forecast -> switch / return SOC, SOC when the sun becomes useful |
+| `LowRule`, `HighRule`, `NightRule`, `OvernightRule` (`ap_rules`) | One reason bit each, latched with their own hold times |
+| `ChargerManager`, `OutputArbiter`, `ChargerWriter` (`ap_writers`) | Grid-charge latch; writing output priority and charger source / current with retries and fault |
+| `AlarmManager`, `sound_allowed` (`ap_alarms`) | Alarms without grid, grid lost / back sounds, quiet hours |
+| `Settings` (`ap_settings.h`, generated) | All controller settings with defaults, from `tools/cyd_settings.py` |
+
+The ESPHome side (`solar_autopilot.{h,cpp}`, `__init__.py`) reads the entities, calls the core
+every 2 s (`control`) and every minute (`minute`), writes the selects, saves the state that must
+survive a reboot, and fires `on_tune` / `on_notify` (the YAML plays the sound and shows the
+message). Screen and HA lambdas read the results with `id(autopilot).status()` (for example
+`.reserve_sw`, `.reasons`, `.soc_at_sun`), `id(autopilot).link()` and `id(autopilot).last_data_ms()`.
+How to use the core elsewhere: [components/solar_autopilot/README.md](components/solar_autopilot/README.md).
+
 ## Workflow
 
 **Rules (from the owner):** back up before changing, validate with `esphome config`, compile only
@@ -325,6 +352,8 @@ at web.esphome.io). `firmware/`, `backups/` and `config/` (secrets) are not in g
 The ESPHome container (`compose.yaml`) uses `./config` as `/config`; copy the YAML there to build:
 
     docker cp inverter-cyd.yaml esphome:/config/inverter-cyd.yaml
+    docker exec esphome sh -c 'rm -rf /config/components/solar_autopilot && mkdir -p /config/components'
+    docker cp components/solar_autopilot esphome:/config/components/
     docker exec esphome esphome config /config/inverter-cyd.yaml
     docker exec -e ESPHOME_ESP_IDF_PREFIX=/config/.esphome/idf esphome esphome compile /config/inverter-cyd.yaml
 
@@ -338,13 +367,23 @@ command line while a dashboard build runs: they share one build folder.
 | `number:` / `switch:`, `ui_sync_all`, `restore_defaults` | `tools/cyd_settings.py` | `python3 tools/cyd_settings_apply.py inverter-cyd.yaml` |
 | `lvgl:` section, `ui_refresh_values`, `set_ui` (shared settings page) | `tools/cyd_ui.py` (pages of settings rows: `VPAGES` in `cyd_settings.py`) | run `cyd_ui.py check / render / yaml / script` in the container, then `tools/cyd_ui_inject.py` |
 | Settings tables in this README | `tools/cyd_settings.py` | `python3 tools/cyd_readme.py README.md` |
+| Controller `Settings` (`ap_settings.h`, `settings_keys.py`) and the `settings:` block of `solar_autopilot:` | `tools/cyd_settings.py` | `python3 tools/gen_autopilot_settings.py` (then update the `settings:` block if a key was added) |
 
 `cyd_ui.py check` verifies against LVGL's real Montserrat glyph widths that no text overlaps or
 leaves the screen; `render` draws PNG previews.
 
-**Simulation.** `tools/sim/run.sh` extracts the controller's code verbatim from the YAML, compiles it
-(g++ in the ESPHome container) against a simulated house, battery, PV, grid and inverter, runs 16
-scenarios (sunny and cloudy days, outages, SOC glitch, link loss, no clock, write failures, observe
-only, …) and checks 160 expectations. Run it after any change to the control logic:
+**Simulation.** `tools/sim/run.sh` compiles the controller core (g++ in the ESPHome container)
+against a simulated house, battery, PV, grid and inverter, runs 16 scenarios (sunny and cloudy
+days, outages, SOC glitch, link loss, no clock, write failures, observe only, …) and checks 160
+expectations. The world calls the core through a small adapter, the same way the ESPHome
+component does, and the YAML's own `play_tune` lambda is extracted and compiled with it. Run it
+after any change to the control logic:
 
     cd tools/sim && ./run.sh ../../inverter-cyd.yaml results
+
+To prove a refactor changes no decision, record a run before it and compare after: every write,
+sound, message and minute sample must be identical (`CORE=1` forces the C++ core for a YAML
+that still has the old lambdas).
+
+    ./run.sh ../../inverter-cyd.yaml results_before     # before the change
+    ./run.sh ../../inverter-cyd.yaml results && diff -r results_before results

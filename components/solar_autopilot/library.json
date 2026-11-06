@@ -1,0 +1,15 @@
+{
+  "name": "solar_autopilot",
+  "version": "0.1.0",
+  "description": "Inverter autopilot core (PI30 / Axpert): output priority rules, reserve planner from a solar forecast, grid-charge manager, alarms. Plain C++17, no framework; the caller passes time and readings in.",
+  "keywords": ["solar", "inverter", "axpert", "pi30", "battery"],
+  "repository": { "type": "git", "url": "https://github.com/rommo911/esphome-solar-inverter-cyd.git" },
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "srcDir": ".",
+    "includeDir": ".",
+    "srcFilter": ["-<*>", "+<ap_*.cpp>"]
+  }
+}

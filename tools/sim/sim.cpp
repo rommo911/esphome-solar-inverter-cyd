@@ -115,7 +115,76 @@ Sel sel_battery_float_voltage{"float_voltage", "27.0"};
 Script<std::string, int, bool> play_tune;
 Script<std::string> notify;
 
+#ifdef USE_CORE
+// The controller logic is the C++ core (components/solar_autopilot); this is its adapter,
+// the same job the ESPHome component does on the device.
+#include "ap/autopilot.h"
+struct SimAutopilot {
+  autopilot_core::Controller ctl;
+  uint32_t last_data = 0;
+  autopilot_core::Settings settings() const {
+    autopilot_core::Settings s;
+#define AP_NUM(k, d) s.k = n_##k.state;
+    AUTOPILOT_NUMBERS(AP_NUM)
+#undef AP_NUM
+    s.auto_ctl = auto_ctl.state; s.observe = sw_observe.state;
+    s.rule_low = sw_rule_low.state; s.rule_high = sw_rule_high.state; s.rule_night = sw_rule_night.state;
+    s.rule_ovn = sw_rule_ovn.state; s.rule_charge = sw_rule_charge.state; s.rule_float = sw_rule_float.state;
+    s.buzzer = sw_buzzer.state; s.quiet = sw_quiet.state;
+    return s;
+  }
+  autopilot_core::Clock clock() const {
+    autopilot_core::Clock c;
+    const ESPTime t = sntp_time.now();
+    c.ms = millis(); c.valid = t.is_valid();
+    if (c.valid) { c.epoch = t.timestamp; c.hour = t.hour; c.minute = t.minute; c.sun_elevation = sun_c.elevation(); }
+    return c;
+  }
+  autopilot_core::Inputs inputs() const {
+    autopilot_core::Inputs in;
+    in.soc = s_soc.state; in.load_w = s_load_power.state; in.pv_w = s_pv_power.state;
+    in.last_data_ms = last_data;
+    in.grid_known = bs_grid.has_state(); in.grid = bs_grid.state;
+    in.output_priority = s_output_source_priority.state; in.charger_source = s_charger_source_priority.state;
+    in.charge_current = s_max_ac_charging_current.state; in.float_voltage = s_battery_float_voltage.state;
+    in.solar_today_kwh = e_solar_today.state;
+    in.forecast_today_kwh = fc_today_kwh; in.forecast_tomorrow_kwh = fc_tomorrow_kwh;
+    return in;
+  }
+  void run(const autopilot_core::Actions &acts);
+  void control() { autopilot_core::Actions a; ctl.control(clock(), inputs(), settings(), a); run(a); }
+  void minute() { autopilot_core::Actions a; ctl.minute(clock(), inputs(), settings(), a); run(a); }
+  void grid_changed(bool g) { autopilot_core::Actions a; ctl.grid_changed(g, clock(), inputs(), a); run(a); }
+  void float_entered() { autopilot_core::Actions a; ctl.float_entered(inputs(), settings(), a); run(a); }
+  bool link() const { return autopilot_core::Controller::link(clock(), inputs()); }
+  bool sound_allowed(bool critical) const { return autopilot_core::sound_allowed(settings(), clock(), critical); }
+} autopilot_sim;
+void SimAutopilot::run(const autopilot_core::Actions &acts) {
+  using autopilot_core::ActionType;
+  static const char *OUT[] = {"Utility first (USB)", "Solar first (SUB)", "Battery first (SBU)"};
+  static const char *CHG[] = {"Utility first", "Solar first", "Solar and utility", "Solar only"};
+  for (const auto &a : acts) {
+    switch (a.type) {
+      case ActionType::NOTIFY: notify.execute(std::string(a.text)); break;
+      case ActionType::TUNE: play_tune.execute(autopilot_core::tune_name((autopilot_core::Tune) a.code), a.prio, a.critical); break;
+      case ActionType::SET_OUTPUT_PRIORITY: sel_output_source_priority.make_call().set_option(OUT[a.code % 3]).perform(); break;
+      case ActionType::SET_CHARGER_SOURCE: sel_charger_source_priority.make_call().set_option(CHG[a.code % 4]).perform(); break;
+      case ActionType::SET_CHARGE_CURRENT: sel_max_ac_charging_current.make_call().set_option(to_string((int) a.value)).perform(); break;
+      case ActionType::SET_FLOAT_VOLTAGE:
+        sel_battery_float_voltage.make_call().set_option(str_sprintf("%.1f", a.value)).perform();
+        s_battery_float_voltage.state = a.value;     // the inverter takes it
+        break;
+      case ActionType::LOG: ESP_LOGW("ctl", "%s", a.text); break;
+    }
+  }
+}
+#define autopilot autopilot_sim        // the YAML lambdas call id(autopilot).sound_allowed(...)
+#endif
+
 #include "gen/lambdas.inc"
+#ifdef USE_CORE
+#undef autopilot
+#endif
 
 // ------------------------------------------------------------------ the world
 struct Scenario {
@@ -223,11 +292,22 @@ int main(int argc, char **argv) {
   TIME_VALID = sc.time_valid;
   auto_ctl.state = sc.auto_on;
   sw_observe.state = sc.observe;                  // YAML default is ON; tests run with it off
-  sol_yday_kwh = (float) sc.yday_kwh;
+  uint32_t sunrise0 = 0;
   if (sc.sunrise_known && TIME_VALID) {           // restored from the previous day
     double d0 = floor(sc.start_min / 1440.0) * 1440;
-    sunrise_ts = EPOCH_DAY0 + (uint32_t) ((d0 + SUNRISE - (sc.start_min - d0 < SUNRISE ? 1440 : 0)) * 60);
+    sunrise0 = EPOCH_DAY0 + (uint32_t) ((d0 + SUNRISE - (sc.start_min - d0 < SUNRISE ? 1440 : 0)) * 60);
   }
+#ifdef USE_CORE
+  {
+    autopilot_core::Persist p;                         // = the YAML globals' initial values
+    p.solar_yesterday_kwh = (float) sc.yday_kwh;
+    p.sunrise_ts = sunrise0;
+    autopilot_sim.ctl.restore(p);
+  }
+#else
+  sol_yday_kwh = (float) sc.yday_kwh;
+  sunrise_ts = sunrise0;
+#endif
   double energy = CAP_WH * sc.soc0 / 100, soc = sc.soc0, solar_today_wh = 0;
   bool grid_raw_prev = false, float_prev = false; uint32_t grid_change_ms = 0;
   double unmet_wh = 0, grid_wh = 0;
@@ -237,6 +317,9 @@ int main(int argc, char **argv) {
   const uint32_t END = (uint32_t) (sc.hours * 3600 * 1000);
   for (SIM_MS = 0; SIM_MS <= END; SIM_MS += 1000) {
     if (SIM_MS == 1000) boot_ms = std::max<uint32_t>(millis(), 1);    // on_boot
+#ifdef USE_CORE
+    if (SIM_MS == 1000) autopilot_sim.ctl.begin(millis());
+#endif
     const double sm = SIM_MS / 60000.0, m = clock_min();
     const int day = (int) (m / 1440.0);
     const bool grid = sc.grid_up(sm);
@@ -270,8 +353,10 @@ int main(int argc, char **argv) {
     grid_wh += from_grid / 3600;
     solar_today_wh += std::min(pv, load + 1500) / 3600;
     const bool new_minute = fmod(SIM_MS / 1000.0, 60) == 0;
+#ifndef USE_CORE                                       // the core keeps yesterday's solar itself
     if (TIME_VALID && new_minute && (int) fmod(m, 1440.0) == 23 * 60 + 59 && !isnan(e_solar_today.state))
       sol_yday_kwh = e_solar_today.state;               // on_time 23:59
+#endif
     if ((int) fmod(m, 1440.0) == 0 && new_minute) { solar_today_wh = 0; fc_curve.clear(); }   // midnight
 
     // --- inverter readings every 2 s (pipsolar). on_raw_value refreshes the data watchdog.
@@ -286,10 +371,18 @@ int main(int argc, char **argv) {
       s_charger_source_priority.state = c == "Utility first" ? 0 : c == "Solar first" ? 1 : c == "Solar and utility" ? 2 : 3;
       s_max_ac_charging_current.state = (float) atof(sel_max_ac_charging_current.inverter.c_str());
       if (isnan(s_battery_float_voltage.state)) s_battery_float_voltage.state = 27.0f;
+#ifdef USE_CORE
+      autopilot_sim.last_data = millis();
+#else
       last_inverter_data = millis();
+#endif
     }
     e_solar_today.state = TIME_VALID ? (float) (solar_today_wh / 1000.0) : NAN;
+#ifdef USE_CORE
+    inv_link.state = autopilot_sim.link(); inv_link.has = true;
+#else
     inv_link.state = L_inv_link(); inv_link.has = true;
+#endif
 
     // --- Grid Available: template lambda + delayed_on/off 30 s, then on_press / on_release
     bool raw = L_grid_raw();
@@ -298,24 +391,42 @@ int main(int argc, char **argv) {
       bool first = !bs_grid.has;
       bs_grid.has = true; bs_grid.state = raw;
       emit("\"ev\":\"grid\",\"on\":%s", raw ? "true" : "false");
+#ifdef USE_CORE
+      if (!first) autopilot_sim.grid_changed(raw);
+#else
       if (!first && L_grid_cond()) {
         if (raw) play_tune.execute("grid_back", 1, false);
         else L_grid_lost();
       }
+#endif
     }
 
     // --- float rule (pipsolar "charging to floating" on_press)
     bool floating = energy >= CAP_WH * 0.995;
+#ifdef USE_CORE
+    if (floating && !float_prev) autopilot_sim.float_entered();
+#else
     if (floating && !float_prev && L_float_cond()) {
       auto c = sel_battery_float_voltage.make_call();
       c.set_option(str_sprintf("%.1f", n_float_v.state)); c.perform();
       s_battery_float_voltage.state = n_float_v.state;
     }
+#endif
     float_prev = floating;
 
     // --- the automations at their YAML intervals
+#ifdef USE_CORE
+    if (SIM_MS % 2000 == 0) autopilot_sim.control();
+    if (SIM_MS % 60000 == 0) autopilot_sim.minute();
+    const auto st = autopilot_sim.ctl.status();
+    const uint8_t sub_reasons = st.reasons;
+    const bool want_sub = st.want_sub, cloudy = st.cloudy, charging = st.charging, ctl_fault = st.fault;
+    const float reserve_sw = st.reserve_sw, reserve_ret = st.reserve_ret, plan_fc = st.plan_fc,
+                soc_at_sun = st.soc_at_sun, base_load = st.base_load;
+#else
     if (SIM_MS % 2000 == 0) L_controller();
     if (SIM_MS % 60000 == 0) { L_planner(); L_alarms(); L_alarm_soc(); }
+#endif
 
     if (SIM_MS % 60000 == 0)
       emit("\"ev\":\"sample\",\"clock\":%.0f,\"soc\":%.2f,\"soc_r\":%.0f,\"load\":%.0f,\"pv\":%.0f,\"grid\":%s,"

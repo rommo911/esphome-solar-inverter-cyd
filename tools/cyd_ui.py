@@ -909,8 +909,8 @@ def emit_ui_script():
     o += ["      - lvgl.label.update:",
           "          id: lbl_age",
           "          text: !lambda |-",
-          "            if (id(last_inverter_data) == 0) return std::string(\"never\");",
-          "            return str_sprintf(\"%us\", (unsigned) ((millis() - id(last_inverter_data)) / 1000));"]
+          "            if (id(autopilot).last_data_ms() == 0) return std::string(\"never\");",
+          "            return str_sprintf(\"%us\", (unsigned) ((millis() - id(autopilot).last_data_ms()) / 1000));"]
     for pid_, code in PROJ.items():
         o += ["      - lvgl.label.update:", f"          id: {pid_}", "          text: !lambda |-"]
         o += ["            " + l for l in code.split("\n")]

@@ -49,13 +49,23 @@ def walk(node):
 
 
 walk(cfg)
+core = "solar_autopilot" in cfg          # logic in the C++ core: only the YAML-side lambdas remain
+
+
+def grab(name, fn):
+    try:
+        lambdas[name] = fn()
+    except (StopIteration, KeyError, IndexError, TypeError):
+        pass
+
+
 bsg = next(b for b in cfg["binary_sensor"] if b.get("id") == "bs_grid")
-lambdas["grid_raw"] = bsg["lambda"]
-lambdas["grid_cond"] = bsg["on_release"][0]["if"]["condition"]["lambda"]
+grab("grid_raw", lambda: bsg["lambda"])
+grab("grid_cond", lambda: bsg["on_release"][0]["if"]["condition"]["lambda"])
 pip_bs = next(b for b in cfg["binary_sensor"] if b.get("platform") == "pipsolar")
-lambdas["float_cond"] = pip_bs["charging_to_floating_mode"]["on_press"][0]["if"]["condition"]["lambda"]
+grab("float_cond", lambda: pip_bs["charging_to_floating_mode"]["on_press"][0]["if"]["condition"]["lambda"])
 inv = next(b for b in cfg["binary_sensor"] if b.get("id") == "inv_link")
-lambdas["inv_link"] = inv["lambda"]
+grab("inv_link", lambda: inv["lambda"])
 
 SIGS = {
     "controller": "void L_controller()", "planner": "void L_planner()", "alarms": "void L_alarms()",
@@ -64,6 +74,8 @@ SIGS = {
     "grid_lost": "void L_grid_lost()", "grid_raw": "bool L_grid_raw()", "grid_cond": "bool L_grid_cond()",
     "float_cond": "bool L_float_cond()", "inv_link": "bool L_inv_link()",
 }
+if core:
+    SIGS = {k: v for k, v in SIGS.items() if k in ("play_tune", "grid_raw")}
 missing = set(SIGS) - set(lambdas)
 assert not missing, f"not found in YAML: {missing}"
 with open(os.path.join(out, "lambdas.inc"), "w") as f:
@@ -81,4 +93,4 @@ with open(os.path.join(out, "entities.inc"), "w") as f:
     for g in cfg["globals"]:
         init = g.get("initial_value")
         f.write(f"{g['type']} {g['id']}" + (f" = {init};\n" if init is not None else "{};\n"))
-print("extracted:", ", ".join(sorted(SIGS)))
+print("extracted:", ", ".join(sorted(SIGS)), "(core mode)" if core else "")
